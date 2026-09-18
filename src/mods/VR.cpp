@@ -304,6 +304,26 @@ void VR::on_camera_get_view_matrix(REManagedObject* camera, Matrix4x4f* result) 
     //auto current_head_pos = -(glm::inverse(vr->get_rotation(0)) * ((vr->get_position(0)) - vr->m_standing_origin));
     //current_head_pos.w = 0.0f;
 
+    // Onimusha: Joint 0 wird NICHT beschrieben (die Writes zerstoeren dort die Weltpose, gemessen
+    // 18.09.2026: flach gilt ViewMatrix == Joint0-Welt == Transform, mit Joint-Writes wird die
+    // ViewMatrix zur Einheitsmatrix). Die Spielkamera laeuft also exakt wie flach, und der Kopf
+    // wird nur hier auf ihre ViewMatrix gesetzt: Welt = Spielkamera * Kopf * Auge.
+    if (sdk::GameIdentity::get().is_onimusha_wots()) {
+        auto head_rotation = glm::identity<glm::quat>();
+        auto head_position = Vector4f{0.0f, 0.0f, 0.0f, 1.0f};
+
+        apply_hmd_transform(head_rotation, head_position);
+
+        auto head = Matrix4x4f{head_rotation};
+
+        if (m_positional_tracking) {
+            head[3] = Vector4f{head_position.x, head_position.y, head_position.z, 1.0f};
+        }
+
+        mtx = current_eye_transform * glm::inverse(head) * mtx;
+        return;
+    }
+
     // Apply the complete eye transform. This fixes the need for parallel projections on all canted headsets like Pimax
     mtx = current_eye_transform * mtx;
 }
@@ -1563,10 +1583,28 @@ void VR::update_camera_origin() {
     }
 
     if (!inside_on_end) {
-        m_original_camera_position = sdk::get_joint_position(camera_joint);
-        m_original_camera_rotation = sdk::get_joint_rotation(camera_joint);
+        // Onimusha carries the real camera pose in the Transform of the "Main Camera".
+        // Joint 0 only holds a local offset (~0) there, so reading the base from the joint
+        // feeds back our own write from the previous frame and collapses onto the world
+        // origin -> the camera sticks in place. Measured: transform == ViewMatrix,
+        // joint 0 == head offset only. The write still goes to joint 0, where it is absolute.
+        if (sdk::GameIdentity::get().is_onimusha_wots()) {
+            auto camera_transform = camera_object->get_transform();
+
+            m_original_camera_position = sdk::get_transform_position(camera_transform);
+            m_original_camera_rotation = sdk::get_transform_rotation(camera_transform);
+        } else {
+            m_original_camera_position = sdk::get_joint_position(camera_joint);
+            m_original_camera_rotation = sdk::get_joint_rotation(camera_joint);
+        }
+
         m_original_camera_matrix = Matrix4x4f{m_original_camera_rotation};
         m_original_camera_matrix[3] = m_original_camera_position;
+    }
+
+    // Onimusha: Kopf kommt ueber on_camera_get_view_matrix, Joint 0 bleibt unangetastet.
+    if (sdk::GameIdentity::get().is_onimusha_wots()) {
+        return;
     }
 
     apply_hmd_transform(camera_joint);
@@ -1607,7 +1645,7 @@ void VR::apply_hmd_transform(::REJoint* camera_joint) {
     sdk::set_joint_rotation(camera_joint, rotation);
 
     if (m_positional_tracking) {
-        sdk::set_joint_position(camera_joint, position);   
+        sdk::set_joint_position(camera_joint, position);
     }
 }
 
@@ -1743,6 +1781,12 @@ void VR::restore_camera() {
     }
 
     if ((sdk::GameIdentity::get().is_re2() || sdk::GameIdentity::get().is_re3()) && FirstPerson::get()->will_be_used()) {
+        m_needs_camera_restore = false;
+        return;
+    }
+
+    // Onimusha: Joint 0 wurde nie beschrieben, also auch nichts zurueckschreiben.
+    if (sdk::GameIdentity::get().is_onimusha_wots()) {
         m_needs_camera_restore = false;
         return;
     }
@@ -2487,6 +2531,38 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
 
                 // Set detonemap = true (fixes weird tint)
                 sdk::call_object_func<void*>(view, "set_Detonemap", context, view, true);
+
+                // Onimusha zeichnet das GUI nur neu, wenn sich daran etwas aendert; sonst bekommt ein
+                // Auge das zwischengespeicherte GUI-Bild des anderen (HUD doppelt / zieht nach).
+                // Bewiesen 18.09.2026 per Lua: jede Frame abwechselnd *1.0001 und /1.0001 skalieren
+                // (unsichtbar) erzwingt das Neuzeichnen - HUD einfach, ohne AFR und Engine-Overlays.
+                if (gi.is_onimusha_wots()) {
+                    static std::mutex s_flip_mtx{};
+                    static std::unordered_map<REComponent*, bool> s_flip{};
+                    static auto transform_object_type = sdk::find_type_definition("via.gui.TransformObject");
+
+                    bool up{};
+                    {
+                        std::scoped_lock _{s_flip_mtx};
+                        auto& flip = s_flip[gui_element];
+                        flip = !flip;
+                        up = flip;
+                    }
+
+                    const auto factor = up ? 1.0001f : 1.0f / 1.0001f;
+
+                    for (auto c = sdk::call_object_func<REManagedObject*>(view, "get_Child", context, view); c != nullptr; c = sdk::call_object_func<REManagedObject*>(c, "get_Next", context, c)) {
+                        const auto t = c->get_type_definition();
+
+                        if (t == nullptr || transform_object_type == nullptr || !t->is_a(transform_object_type)) {
+                            continue;
+                        }
+
+                        const auto old_scale = sdk::call_object_func_easy<Vector4f>(c, "get_Scale");
+                        Vector4f new_scale{ old_scale.x * factor, old_scale.y * factor, old_scale.z * factor, 1.0f };
+                        sdk::call_object_func<void*>(c, "set_Scale", context, c, &new_scale);
+                    }
+                }
 
                 // Go through the children until we hit a blur filter
                 // And then remove it
