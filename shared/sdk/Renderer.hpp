@@ -473,6 +473,23 @@ public:
         return *(sdk::intrusive_ptr<sdk::renderer::TargetState>*)((uintptr_t)this + RenderLayer::get_runtime_sizeof());
     }
 
+    // [ONI_UIBUF] wie PureDark RE9AFW 701f254c: UI-Puffer der Overlay-Schicht (Reflection-Feld)
+    ID3D12Resource* get_ui_buffer_tex_d3d12() {
+        const auto tex = this->get_reflection_property<sdk::renderer::Texture*>("UIBufferTexturePtr");
+
+        if (tex == nullptr) {
+            return nullptr;
+        }
+
+        const auto internal_resource = tex->get_d3d12_resource_container();
+
+        if (internal_resource == nullptr) {
+            return nullptr;
+        }
+
+        return internal_resource->get_native_resource();
+    }
+
     sdk::renderer::Texture** get_b8g8r8a8_unorm_textures() {
         return (sdk::renderer::Texture**)((uintptr_t)this + s_b8g8r8a8_unorm_textures_offset);
     }

@@ -178,6 +178,23 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         }
     }
 
+    // [ONI_UIBUF] UI-Puffer der Engine leeren (PureDark RE9AFW D3D12Component::on_frame). Die
+    // Overlay-Schicht, die das sonst macht, laeuft bei "Allow Engine Overlays" AUS nicht.
+    if (auto ui_buf = vr->m_ui_buffer_tex.load(); ui_buf != nullptr) {
+        if (ui_buf != m_ui_buffer_src) {
+            m_ui_buffer.reset();
+            m_ui_buffer_src = ui_buf;
+            m_ui_buffer_failed = !m_ui_buffer.setup(device, ui_buf, std::nullopt, std::nullopt, L"ONI UI buffer");
+        }
+
+        if (!m_ui_buffer_failed) {
+            const float clear_color[4]{0.0f, 0.0f, 0.0f, 0.0f};
+            m_ui_buffer.commands.wait(INFINITE);
+            m_ui_buffer.commands.clear_rtv(m_ui_buffer, clear_color, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            m_ui_buffer.commands.execute();
+        }
+    }
+
     m_prev_backbuffer = backbuffer;
 
     return e;
@@ -204,6 +221,10 @@ void D3D12Component::on_reset(VR* vr) {
     m_prev_backbuffer.Reset();
     m_backbuffer_copy.reset();
     m_converted_eye_tex.reset();
+    m_ui_buffer.reset();         // [ONI_UIBUF]
+    m_ui_buffer_src = nullptr;
+    m_ui_buffer_failed = false;
+    vr->m_ui_buffer_tex = nullptr;
 
     if (runtime->is_openxr() && runtime->loaded) {
         if (m_openxr.last_resolution[0] != vr->get_hmd_width() || m_openxr.last_resolution[1] != vr->get_hmd_height()) {

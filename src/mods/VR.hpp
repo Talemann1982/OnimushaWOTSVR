@@ -4,6 +4,7 @@
 #include <bitset>
 #include <memory>
 #include <shared_mutex>
+#include <atomic>
 
 #include <openvr.h>
 
@@ -96,6 +97,9 @@ public:
     int32_t get_frame_count() const;
     int32_t get_game_frame_count() const;
 
+    // [ONI_RENDER] AFR-Schalter fuer die Menue-Kategorie RENDERING (gleicher Config-Wert)
+    bool& afr_value() { return m_use_afr->value(); }
+
     bool is_using_afr() const {
         return m_use_afr->value();
     }
@@ -170,6 +174,21 @@ public:
 
     Vector2f get_left_stick_axis() const;
     Vector2f get_right_stick_axis() const;
+
+    // [ONI_MENU 26.09.2026, aus dem RE9-Fork] Solange das Menue offen ist (und kurz
+    // danach, bis alles losgelassen ist), liefern is_action_active und
+    // get_*_stick_axis NICHTS -- die zentrale Stelle, ueber die alle Module und Lua
+    // die Controller lesen. Das Menue selbst liest ueber die _raw-Varianten.
+    bool is_action_active_raw(vr::VRActionHandle_t action, vr::VRInputValueHandle_t source = vr::k_ulInvalidInputValueHandle) const;
+    bool is_menu_input_blocked() const;
+    void set_menu_release_guard(bool on) { m_menu_release_guard = on; }
+    bool is_menu_release_guard() const { return m_menu_release_guard; }
+    bool m_menu_release_guard{false};
+
+    Vector2f get_joystick_axis_raw(vr::VRInputValueHandle_t handle) const;
+    Vector2f get_left_stick_axis_raw() const;
+    Vector2f get_right_stick_axis_raw() const;
+    Vector2f get_right_touchpad_axis() const;   // [ONI_MENU] wie RE9: vorerst immer 0
 
     void trigger_haptic_vibration(float seconds_from_now, float duration, float frequency, float amplitude, vr::VRInputValueHandle_t source = vr::k_ulInvalidInputValueHandle);
     
@@ -462,6 +481,8 @@ private:
     bool m_needs_camera_restore{false};
     bool m_needs_audio_restore{false};
     bool m_in_render{false};
+    // [ONI_UIBUF] zuletzt gesehener UI-Puffer der Overlay-Schicht (in D3D12Component geleert)
+    std::atomic<ID3D12Resource*> m_ui_buffer_tex{nullptr};
     bool m_in_lightshaft{false};
     bool m_positional_tracking{true};
     bool m_is_d3d12{false};
@@ -502,7 +523,7 @@ private:
     const ModSlider::Ptr m_motion_controls_inactivity_timer{ ModSlider::create(generate_name("MotionControlsInactivityTimer"), 30.0f, 100.0f, 30.0f) };
     const ModSlider::Ptr m_joystick_deadzone{ ModSlider::create(generate_name("JoystickDeadzone"), 0.01f, 0.9f, 0.15f) };
     const ModSlider::Ptr m_ui_scale_option{ ModSlider::create(generate_name("2DUIScale"), 1.0f, 100.0f, 12.0f) };
-    const ModSlider::Ptr m_ui_distance_option{ ModSlider::create(generate_name("2DUIDistance"), 0.01f, 100.0f, 1.0f) };
+    const ModSlider::Ptr m_ui_distance_option{ ModSlider::create(generate_name("2DUIDistance"), 0.01f, 100.0f, 1.3f) };   // [ONI_UIDIST] Default 1.3 statt 1.0 (User 27.09.2026)
     const ModSlider::Ptr m_world_ui_scale_option{ ModSlider::create(generate_name("WorldSpaceUIScale"), 1.0f, 100.0f, 15.0f) };
     const ModSlider::Ptr m_resolution_scale{ ModSlider::create(generate_name("OpenXRResolutionScale"), 0.1f, 5.0f, 1.0f) };
 

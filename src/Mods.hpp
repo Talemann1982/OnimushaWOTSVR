@@ -15,6 +15,10 @@ public:
     void on_present() const;
     void on_post_frame() const;
     void on_draw_ui() const;
+
+    // [ONI_MENU 26.09.2026, aus dem RE9-Fork] Die REFramework-EIGENEN Trees (VR,
+    // Camera, Graphics, ...), Kategorie "REFramework Options" des Menues.
+    void draw_ref_trees() const;
     void on_device_reset() const;
 
     const auto& get_mods() const {

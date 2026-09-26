@@ -428,6 +428,13 @@ void VR::inputsystem_update_hook(void* ctx, REManagedObject* input_system) {
 }
 
 bool VR::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* render_ctx) {
+    // [ONI_UIBUF] Bei "Allow Engine Overlays" AUS wird diese Schicht uebersprungen, und die leert
+    // sonst den UI-Puffer -> UI schmiert/klont (belegt 26.09.2026: Overlays AN heilt es, schielt aber).
+    // Wie PureDark RE9AFW: Puffer merken, D3D12Component leert ihn jeden Frame.
+    if (layer != nullptr) {
+        m_ui_buffer_tex = layer->get_ui_buffer_tex_d3d12();
+    }
+
     // just don't render anything at all.
     // overlays just seem to break stuff in VR.
     if (!is_hmd_active()) {
@@ -2278,6 +2285,10 @@ void VR::on_present() {
             }
 
             openvr->is_hmd_active = hmd_active;
+            // [ONI_HMD_FEST] wie PureDark in RE4RAFW/RE9AFW: Index meldet per Naeherungssensor
+            // staendig 103/104 -> 5 s spaeter hmd inaktiv -> "wait_rendering timed out" + Resize/
+            // Device-Reset -> Bild schwarz, UI schmiert (Log 26.09.2026 23:11:03 -> 23:11:08).
+            openvr->is_hmd_active = true;
 
             // upon headset re-entry, reinitialize OpenVR
             if (openvr->is_hmd_active && !openvr->was_hmd_active) {
@@ -2782,10 +2793,26 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
                             wanted_rotation = gui_rotation_offset * wanted_rotation;
                         }
 
+                        // [ONI_HUD_KOPF] Onimusha: HUD-Tafel fest vor dem Headset (User 26.09.2026). Vorher hing sie an
+                        // der Spielkamera ohne Kopf (m_original_camera_matrix, Neigung glattgezogen) und wanderte mit
+                        // jeder Kameradrehung des Spiels mit.
+                        auto hud_position = camera_position;
+
+                        if (gi.is_onimusha_wots() && !wants_face_glue) {
+                            wanted_rotation = glm::extractMatrixRotation(m_render_camera_matrix) * Matrix4x4f{
+                                -1, 0, 0, 0,
+                                0, 1, 0, 0,
+                                0, 0, -1, 0,
+                                0, 0, 0, 1
+                            };
+                            wanted_rotation = get_gui_rotation_offset() * wanted_rotation;
+                            hud_position = m_render_camera_matrix[3];
+                        }
+
                         const auto wanted_rotation_mat = Matrix4x4f{wanted_rotation};
 
                         gui_matrix = wanted_rotation_mat;
-                        gui_matrix[3] = camera_position + (wanted_rotation_mat[2] * ui_distance) + (wanted_rotation_mat[0] * right_world_adjust);
+                        gui_matrix[3] = hud_position + (wanted_rotation_mat[2] * ui_distance) + (wanted_rotation_mat[0] * right_world_adjust);
                         gui_matrix[3].w = 1.0f;
 
                         // Scales the GUI so it's not massive.
@@ -2812,6 +2839,104 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
                         };
                         
                         // Fix position of interaction icons
+                        // [ONI_HPBAR] Onimusha Gegner-Lebensleiste: ein GUI (GUI020207) fuer alle Gegner, das Spiel
+                        // setzt jede Leiste auf die Bildschirmposition der FLACHEN Kamera -> in VR daneben.
+                        // Option B (User 26.09.2026): es ist immer nur eine sichtbar -> ganzes GUI an den Kopf
+                        // dieses Gegners haengen und die Leisten-Panels auf 0 setzen (wie RE7 InteractOperationCursor).
+                        if (gi.is_onimusha_wots() && name_hash == "GUI020207"_fnv) {
+                            static auto hpbar_typedef = sdk::find_type_definition("app.GUI020207");
+                            auto hpbar_comp = hpbar_typedef != nullptr ? game_object->get_transform()->find(hpbar_typedef->get_type()) : nullptr;
+
+                            std::optional<Vector4f> head_pos{};
+
+                            if (hpbar_comp != nullptr) {
+                                auto list = sdk::get_object_field<::REManagedObject*>(hpbar_comp, "_EnemyInfoList");
+
+                                if (list != nullptr && *list != nullptr) {
+                                    const auto count = sdk::call_object_func_easy<int32_t>(*list, "get_Count");
+                                    float best_dist = std::numeric_limits<float>::max();
+                                    bool best_lock = false;
+
+                                    for (int32_t i = 0; i < count; ++i) {
+                                        auto info = sdk::call_object_func_easy<::REManagedObject*>(*list, "get_Item", i);
+
+                                        if (info == nullptr) {
+                                            continue;
+                                        }
+
+                                        auto visible = sdk::get_object_field<bool>(info, "_IsVisible");
+                                        auto disp = sdk::get_object_field<bool>(info, "_DispRequested");
+
+                                        if (visible == nullptr || !*visible || disp == nullptr || !*disp) {
+                                            continue;
+                                        }
+
+                                        auto dist_ptr = sdk::get_object_field<float>(info, "_PlayerDistance");
+                                        auto lock_ptr = sdk::get_object_field<bool>(info, "_IsLockOn");
+                                        const auto dist = dist_ptr != nullptr ? *dist_ptr : 0.0f;
+                                        const auto lock = lock_ptr != nullptr && *lock_ptr;
+
+                                        // Anvisierter Gegner gewinnt, sonst der naechste
+                                        if (!(lock && !best_lock) && !(lock == best_lock && dist < best_dist)) {
+                                            continue;
+                                        }
+
+                                        auto enemy = sdk::get_object_field<::REManagedObject*>(info, "_EnemyCharacter");
+
+                                        if (enemy == nullptr || *enemy == nullptr) {
+                                            continue;
+                                        }
+
+                                        auto enemy_go = sdk::call_object_func_easy<REGameObject*>(*enemy, "get_GameObject");
+
+                                        if (enemy_go == nullptr || enemy_go->get_transform() == nullptr) {
+                                            continue;
+                                        }
+
+                                        auto head = sdk::get_transform_joint_by_name(enemy_go->get_transform(), L"Head");
+
+                                        if (head == nullptr) {
+                                            continue;
+                                        }
+
+                                        auto p = sdk::get_joint_position(head);
+                                        p.y += 0.35f; // etwas ueber den Kopf
+                                        p.w = 1.0f;
+                                        head_pos = p;
+                                        best_dist = dist;
+                                        best_lock = lock;
+                                    }
+                                }
+                            }
+
+                            if (head_pos) {
+                                fix_2d_position(*head_pos, true, 10.0f); // screen_correction wie RE2-RE4; Groesse 10 statt World-UI-Scale 15 (User: "etwas gross")
+
+                                // Leisten-Panels (RootWindow -> PNL_ALL -> PNL_EnemyHP_*) auf den Ursprung
+                                static auto panel_type = sdk::find_type_definition("via.gui.Panel");
+                                Vector3f zero{0.0f, 0.0f, 0.0f};
+
+                                for (auto root = child; root != nullptr; root = sdk::call_object_func<REManagedObject*>(root, "get_Next", context, root)) {
+                                    for (auto c = sdk::call_object_func<REManagedObject*>(root, "get_Child", context, root); c != nullptr; c = sdk::call_object_func<REManagedObject*>(c, "get_Next", context, c)) {
+                                        const auto c_name = utility::re_string::get_string(sdk::call_object_func_easy<SystemString*>(c, "get_Name"));
+
+                                        if (c_name != "PNL_ALL") {
+                                            continue;
+                                        }
+
+                                        sdk::call_object_func<void*>(c, "set_Position", context, c, &zero);
+
+                                        for (auto bar = sdk::call_object_func<REManagedObject*>(c, "get_Child", context, c); bar != nullptr; bar = sdk::call_object_func<REManagedObject*>(bar, "get_Next", context, bar)) {
+                                            const auto t = bar->get_type_definition();
+
+                                            if (t != nullptr && panel_type != nullptr && t->is_a(panel_type)) {
+                                                sdk::call_object_func<void*>(bar, "set_Position", context, bar, &zero);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else
                         if (name_hash == "GUI_FloatIcon"_fnv || name_hash == "RogueFloatIcon"_fnv || name_hash == "Gui_FloatIcon"_fnv) { // RE2, RE3, RE4
                             if (name_hash == "GUI_FloatIcon"_fnv || name_hash == "Gui_FloatIcon"_fnv) {
                                 m_last_interaction_display = std::chrono::steady_clock::now();
@@ -3066,6 +3191,11 @@ void VR::on_pre_begin_rendering(void* entry) {
             m_openxr->wants_reinitialize = false;
             reinitialize_openxr();
         }
+
+        // [ONI_REINIT] reinitialize_* ersetzt m_runtime -> der lokale Zeiger zeigt auf das
+        // zerstoerte Objekt; unten folgt runtime->consume_events() = AV (Vtable 0).
+        // Crash beim Headset-Aufsetzen 26.09.2026 (VR.cpp:3100, per PDB belegt).
+        runtime = get_runtime();
     }
 
     detect_controllers();
@@ -4164,11 +4294,25 @@ vr::HmdMatrix34_t VR::get_raw_transform(uint32_t index) const {
     }
 }
 
+// [ONI_MENU 26.09.2026, aus dem RE9-Fork] Die Sperre: Menue offen ODER
+// Loslass-Waechter nach dem Schliessen (REFramework::run_vr_menu_frame setzt/loest ihn).
+bool VR::is_menu_input_blocked() const {
+    return m_menu_release_guard || (g_framework != nullptr && g_framework->is_drawing_ui());
+}
+
 bool VR::is_action_active(vr::VRActionHandle_t action, vr::VRInputValueHandle_t source) const {
+    if (is_menu_input_blocked()) {
+        return false;
+    }
+
+    return is_action_active_raw(action, source);
+}
+
+bool VR::is_action_active_raw(vr::VRActionHandle_t action, vr::VRInputValueHandle_t source) const {
     if (!get_runtime()->loaded) {
         return false;
     }
-    
+
     bool active = false;
 
     if (get_runtime()->is_openvr()) {
@@ -4181,13 +4325,22 @@ bool VR::is_action_active(vr::VRActionHandle_t action, vr::VRInputValueHandle_t 
     }
 
     if (!active && action == m_action_minimap) {
-        active = is_action_active(m_action_b_button, m_left_joystick) && is_hand_behind_head(VRRuntime::Hand::LEFT);
+        active = is_action_active_raw(m_action_b_button, m_left_joystick) && is_hand_behind_head(VRRuntime::Hand::LEFT);   // [ONI_MENU] _raw
     }
 
     return active;
 }
 
 Vector2f VR::get_joystick_axis(vr::VRInputValueHandle_t handle) const {
+    // [ONI_MENU 26.09.2026] Bei offenem Menue stehen die Sticks fuers Spiel still.
+    if (is_menu_input_blocked()) {
+        return Vector2f{};
+    }
+
+    return get_joystick_axis_raw(handle);
+}
+
+Vector2f VR::get_joystick_axis_raw(vr::VRInputValueHandle_t handle) const {
     if (!get_runtime()->loaded) {
         return Vector2f{};
     }
@@ -4219,6 +4372,22 @@ Vector2f VR::get_left_stick_axis() const {
 
 Vector2f VR::get_right_stick_axis() const {
     return get_joystick_axis(m_right_joystick);
+}
+
+// [ONI_MENU 26.09.2026, aus dem RE9-Fork] Rohe Sticks fuer die Menue-Steuerung.
+Vector2f VR::get_left_stick_axis_raw() const {
+    return get_joystick_axis_raw(m_left_joystick);
+}
+
+Vector2f VR::get_right_stick_axis_raw() const {
+    return get_joystick_axis_raw(m_right_joystick);
+}
+
+// [ONI_MENU] Wie RE9: im RE4-Fork scrollt das rechte Trackpad das Menue. Dafuer
+// braucht es eigene Touchpad-Aktionen, die hier nicht portiert sind -- bis dahin
+// liefert es nichts, gescrollt wird ueber den rechten Stick.
+Vector2f VR::get_right_touchpad_axis() const {
+    return Vector2f{};
 }
 
 void VR::trigger_haptic_vibration(float seconds_from_now, float duration, float frequency, float amplitude, vr::VRInputValueHandle_t source) {

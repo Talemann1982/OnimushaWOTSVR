@@ -114,6 +114,15 @@
 //---- Debug Tools: Enable slower asserts
 //#define IMGUI_DEBUG_PARANOID
 
+//---- [ONI_MENU 26.09.2026, aus dem RE9-Fork] ImGuis Test-Engine-Hooks
+// einschalten. Damit meldet jedes Widget ueber ImGuiTestEngineHook_ItemInfo
+// seine Art und seinen Zustand (Checkable/Checked, Openable/Opened, Inputable).
+// REFramework.cpp definiert die vier Hook-Funktionen; daraus lebt die
+// Controller-/Tastatur-Navigation des Menues (Spaltenwechsel, Slider). Die Aufrufe
+// laufen NUR, solange ImGuiContext::TestEngineHookItems gesetzt ist -- das tut
+// REFramework ausschliesslich im rechten Bereich des Menues.
+#define IMGUI_ENABLE_TEST_ENGINE
+
 //---- Tip: You can add extra functions within the ImGui:: namespace, here or in your own headers files.
 /*
 namespace ImGui

@@ -1,6 +1,11 @@
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <windows.h>
+#include <Xinput.h>   // [ONI_PAD] nur Typen/Konstanten, Funktion per LoadLibrary
+#include <utility/FunctionHook.hpp>
 
 #include <windows.h>
 #include <ShlObj.h>
@@ -19,12 +24,23 @@ extern "C" {
 };
 
 #include <imgui.h>
-#include <imgui_internal.h>
+#include <imgui_internal.h>   // [ONI_MENU] auch SeparatorEx (dickere Trennstriche im Menue)
 #include <imgui_freetype.h>
 #include <ImGuizmo.h>
 #include <imnodes.h>
 #include "re2-imgui/af_faprolight.hpp"
 #include "re2-imgui/font_robotomedium.hpp"
+// [ONI_MENU 26.09.2026] Menue-Schriften und Logo aus dem RE9-Fork.
+// Ueberschriften-/Kategorien-Schrift tauschen: neuen font_*.hpp-Header hier
+// einbinden und ONI_MENU_HEADING_TTF unten auf dessen Array setzen.
+#include "re2-imgui/font_barlowcondensed_semibold.hpp" // Grundschrift Menue
+#include "re2-imgui/font_requiem9.hpp"                // Ueberschriften + Kategorien (vorerst die RE9-Schrift)
+#include "re2-imgui/img_oni_bindings.hpp"             // [ONI_BIND] Bild der Kategorie BINDINGS
+#include "re2-imgui/img_oni_logo.hpp"                 // Logo oben in der Kategorien-Spalte
+#define ONI_MENU_HEADING_TTF requiem9_ttf
+#include <../../directxtk12-src/Inc/WICTextureLoader.h>      // [ONI_MENU] Logo laden
+#include <../../directxtk12-src/Inc/ResourceUploadBatch.h>
+
 #include "re2-imgui/imgui_impl_dx11.h"
 #include "re2-imgui/imgui_impl_dx12.h"
 #include "re2-imgui/imgui_impl_win32.h"
@@ -844,6 +860,13 @@ REFramework::~REFramework() {
 
     ImGui_ImplWin32_Shutdown();
 
+    // [VR-MENUE-KONTEXT 11.09.2026] Zuerst der VR-Kontext -- er teilt den
+    // Schriftatlas des Desktop-Kontexts, der darf also erst danach gehen.
+    if (m_vr_menu.ctx != nullptr) {
+        ImGui::DestroyContext(m_vr_menu.ctx);
+        m_vr_menu.ctx = nullptr;
+    }
+
     if (m_initialized) {
         ImGui::DestroyContext();
     }
@@ -872,13 +895,35 @@ void REFramework::run_imgui_frame(bool from_present) {
         m_mods->on_pre_imgui_frame();
     }
 
+    // [ONI_MENU 26.09.2026] Werte des Menu Editors einmalig laden (oni_vr_menu.txt).
+    if (!m_menu_editor_cfg_loaded) {
+        load_menu_editor_cfg();
+    }
+
+    // [TASTATUR-NAVIGATION 16.09.2026] Pfeile/Leertaste/Backspace -> ImGui-Navigation.
+    run_desk_menu_keyboard();
+
     ImGui::NewFrame();
 
     if (!from_present) {
         call_on_frame();
     }
 
+    // [MENUE-SOUNDS 11.09.2026] Menue auf ODER zu -> derselbe Sound. Gilt fuer
+    // jeden Weg (LT + linkes B, Insert, X am Desktop-Fenster). Der erste Frame
+    // merkt nur den Zustand, sonst klaenge es beim Spielstart.
+    if (!m_menu_sound_prev_draw_ui.has_value()) {
+        m_menu_sound_prev_draw_ui = m_draw_ui;
+    } else if (*m_menu_sound_prev_draw_ui != m_draw_ui) {
+        m_menu_sound_prev_draw_ui = m_draw_ui;
+
+        if (is_init_ok) {
+            queue_menu_sound(MenuSound::Open);
+        }
+    }
+
     draw_ui();
+
     m_last_draw_ui = m_draw_ui;
 
     ensure_ui_layout_baseline();
@@ -895,6 +940,20 @@ void REFramework::run_imgui_frame(bool from_present) {
 
     ImGui::EndFrame();
     ImGui::Render();
+
+    // [TASTATUR-NAVIGATION 16.09.2026] Nav-Info fuer den naechsten Frame; Backspace
+    // in der Kategorien-Spalte schliesst das Menue -- erst nach dem Frame.
+    m_desk_menu.nav_item_flags = m_desk_menu.frame_nav_item_flags;
+    m_desk_menu.frame_nav_item_flags = 0;
+
+    if (m_desk_menu_close) {
+        m_desk_menu_close = false;
+        set_draw_ui(false);
+    }
+
+    // [VR-MENUE-KONTEXT 11.09.2026] Direkt danach der Frame des VR-Menues --
+    // noch unter m_imgui_mtx, damit on_frame_d3d12 nie mittendrin rendert.
+    run_vr_menu_frame();
 
     m_has_frame = true;
 
@@ -1136,8 +1195,20 @@ void REFramework::on_frame_d3d12() {
             cmd_ctx->cmd_list->OMSetRenderTargets(1, rts, FALSE, NULL);
             cmd_ctx->cmd_list->SetDescriptorHeaps(1, m_d3d12.srv_desc_heap.GetAddressOf());
     
-            ImGui::GetIO().BackendRendererUserData = m_d3d12.imgui_backend_datas[1];
-            ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), cmd_ctx->cmd_list.Get());
+            // [VR-MENUE-KONTEXT 11.09.2026] Hier landete frueher der Desktop-
+            // Frame, von dem VR nur den Fensterausschnitt zeigte. Jetzt kommt
+            // der eigene VR-Menue-Kontext hinein, der die Textur ganz fuellt.
+            // Renderer ist weiter das zweite DX12-Backend; seine Daten haengen
+            // nur fuer diesen Aufruf am VR-Kontext.
+            if (m_vr_menu.has_draw_data && m_vr_menu.ctx != nullptr) {
+                const auto main_ctx = ImGui::GetCurrentContext();
+
+                ImGui::SetCurrentContext(m_vr_menu.ctx);
+                ImGui::GetIO().BackendRendererUserData = m_d3d12.imgui_backend_datas[1];
+                ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), cmd_ctx->cmd_list.Get());
+                ImGui::GetIO().BackendRendererUserData = nullptr;
+                ImGui::SetCurrentContext(main_ctx);
+            }
             
             barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
             barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
@@ -1362,7 +1433,19 @@ bool REFramework::on_message(HWND wnd, UINT message, WPARAM w_param, LPARAM l_pa
         break;
     }
 
-    ImGui_ImplWin32_WndProcHandler(wnd, message, w_param, l_param);
+    // [TASTATUR-NAVIGATION 16.09.2026] Pfeile, Leertaste und Backspace gibt
+    // run_desk_menu_keyboard selbst an ImGui weiter (nach den Menue-Regeln). Die
+    // echten Nachrichten dieser Tasten gehen deshalb bei offenem Menue NICHT an
+    // ImGui -- ausser ein Textfeld ist aktiv, das braucht sie roh. m_last_keys
+    // oben wurde trotzdem gesetzt, daraus liest die Navigation.
+    const bool desk_nav_key = m_draw_ui && !ImGui::GetIO().WantTextInput
+        && (message == WM_KEYDOWN || message == WM_KEYUP || message == WM_CHAR
+            || message == WM_SYSKEYDOWN || message == WM_SYSKEYUP)
+        && is_desk_menu_nav_key(message == WM_CHAR ? (w_param == ' ' ? VK_SPACE : (w_param == '\b' ? VK_BACK : 0)) : w_param);
+
+    if (!desk_nav_key) {
+        ImGui_ImplWin32_WndProcHandler(wnd, message, w_param, l_param);
+    }
 
     {
         // If the user is interacting with the UI we block the message from going to the game.
@@ -1650,7 +1733,20 @@ void REFramework::init_fonts() {
             ImFontConfig cfg{};
             cfg.FontDataOwnedByAtlas = false;
 
-            loaded_fonts["DEFAULT"] = fonts->AddFontFromMemoryCompressedTTF(RobotoCJKSC_Medium_compressed_data, RobotoCJKSC_Medium_compressed_size, m_font_size, &cfg);
+            // [BARLOW 11.09.2026 / RE9 21.09.2026] Grundschrift wie im RE4-Menue:
+            // Barlow Condensed SemiBold (nur Latin). Roboto CJK darunter
+            // EINGEMISCHT -- alles, was Barlow nicht hat, kommt weiter von dort.
+            static const ImWchar latin_ranges[] = {0x0020, 0x00FF, 0};
+
+            loaded_fonts["DEFAULT"] = fonts->AddFontFromMemoryTTF((void*)barlow_condensed_semibold_ttf, (int)sizeof(barlow_condensed_semibold_ttf),
+                m_font_size, &cfg, latin_ranges);
+
+            if (loaded_fonts["DEFAULT"] != nullptr) {
+                ImFontConfig cjk_cfg{};
+                cjk_cfg.FontDataOwnedByAtlas = false;
+                cjk_cfg.MergeMode = true;
+                fonts->AddFontFromMemoryCompressedTTF(RobotoCJKSC_Medium_compressed_data, RobotoCJKSC_Medium_compressed_size, m_font_size, &cjk_cfg);
+            }
 
             if (loaded_fonts["DEFAULT"] == nullptr) {
                 spdlog::error("Failed to load default font!");
@@ -1673,6 +1769,45 @@ void REFramework::init_fonts() {
         static const ImWchar icon_ranges[] = {0xF000, 0xF976, 0}; // ICON_MIN_FA ICON_MAX_FA
         loaded_fonts["ICON"] = fonts->AddFontFromMemoryTTF((void*)af_faprolight_ptr, af_faprolight_size, m_font_size, &custom_icons, icon_ranges);
     }*/
+
+    // [ONI_MENU 26.09.2026] [UEBERSCHRIFTEN / VR-SCHRIFT, aus dem RE9-Fork] Die Menue-Schriften
+    // des RE4-Menues: Titelschrift fuer Ueberschriften und Kategorien, dazu die
+    // VR_FONT_OVERSAMPLE-fach grossen Fassungen fuer das VR-Menue. Einmalig --
+    // der Atlas wird nie geleert. Ueberschriften-Schrift = ONI_MENU_HEADING_TTF (oben).
+    if (!loaded_fonts.contains("MENU_HEADING")) {
+        static const ImWchar heading_ranges[] = {0x0020, 0x00FF, 0};
+        static const ImWchar latin_ranges[] = {0x0020, 0x00FF, 0};
+        static const ImWchar icon_ranges[] = {0xF000, 0xF976, 0}; // ICON_MIN_FA ICON_MAX_FA
+
+        ImFontConfig heading_cfg{};
+        heading_cfg.FontDataOwnedByAtlas = false;
+        loaded_fonts["MENU_HEADING"] = fonts->AddFontFromMemoryTTF((void*)ONI_MENU_HEADING_TTF, (int)sizeof(ONI_MENU_HEADING_TTF),
+            (float)(m_font_size + HEADING_FONT_EXTRA), &heading_cfg, heading_ranges);
+
+        const auto vr_size = (float)(m_font_size * VR_FONT_OVERSAMPLE);
+
+        ImFontConfig vr_base_cfg{};
+        vr_base_cfg.FontDataOwnedByAtlas = false;
+        loaded_fonts["MENU_VR_BASE"] = fonts->AddFontFromMemoryTTF((void*)barlow_condensed_semibold_ttf, (int)sizeof(barlow_condensed_semibold_ttf),
+            vr_size, &vr_base_cfg, latin_ranges);
+
+        ImFontConfig vr_icon_cfg{};
+        vr_icon_cfg.MergeMode = true;
+        vr_icon_cfg.PixelSnapH = true;
+        vr_icon_cfg.FontDataOwnedByAtlas = false;
+        fonts->AddFontFromMemoryTTF((void*)af_faprolight_ptr, af_faprolight_size, vr_size, &vr_icon_cfg, icon_ranges);
+
+        ImFontConfig vr_heading_cfg{};
+        vr_heading_cfg.FontDataOwnedByAtlas = false;
+        loaded_fonts["MENU_VR_HEADING"] = fonts->AddFontFromMemoryTTF((void*)ONI_MENU_HEADING_TTF, (int)sizeof(ONI_MENU_HEADING_TTF),
+            (float)((m_font_size + HEADING_FONT_EXTRA) * VR_FONT_OVERSAMPLE), &vr_heading_cfg, heading_ranges);
+    }
+
+    m_heading_font = loaded_fonts["MENU_HEADING"];
+    m_vr_font_base = loaded_fonts["MENU_VR_BASE"];
+    m_vr_font_heading = loaded_fonts["MENU_VR_HEADING"];
+    // [KATEGORIE-SCHRIFT 11.09.2026] Kategorien links in derselben Titelschrift.
+    m_vr_font_nav = m_vr_font_heading;
 
     m_wants_device_object_cleanup = true;
 }
@@ -1939,46 +2074,20 @@ void REFramework::draw_ui() {
         m_windows_message_hook->window_toggle_cursor(true);
     }
 
-    ImGui::SetNextWindowPos(ImVec2(50, 50), ImGuiCond_::ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(300, 500), ImGuiCond_::ImGuiCond_FirstUseEver);
-
+    // [ONI_MENU 26.09.2026] [VR-MENUE-KONTEXT, aus dem RE9-Fork] Das Fenster zeichnet
+    // jetzt draw_menu_window -- dieselbe Funktion laeuft im VR-Kontext noch einmal
+    // bildschirmfuellend. Upstreams preserve_main_window_position entfaellt dafuer
+    // (das Menue ist fest bildschirmfuellend und ohne ini).
+    m_desk_menu.drawing = true;
+    // [ImGui 1.92] Grundschrift in der eingestellten Groesse.
     ImGui::PushFont(m_default_font, m_font_size);
-    static const auto REF_NAME = std::format("REFramework [{}+{}-{:.8}]", REF_TAG, REF_COMMITS_PAST_TAG, REF_COMMIT_HASH);
-    preserve_main_window_position(REF_NAME.c_str());
-    bool is_open = true;
-    ImGui::Begin(REF_NAME.c_str(), &is_open);
-    const auto* main_window = ImGui::GetCurrentWindow();
-    ImGui::Text("Default Menu Key: Insert");
-    ImGui::Checkbox("Transparency", &m_ui_option_transparent);
-    ImGui::SameLine();
-    ImGui::Text("(?)");
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Makes the UI transparent when not focused.");
-    ImGui::Checkbox("Input Passthrough", &m_ui_passthrough);
-    ImGui::SameLine();
-    ImGui::Text("(?)");
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Allows mouse and keyboard inputs to register to the game while the UI is focused.");
-
-    // Mods:
-    draw_about();
-
-    if (m_error.empty() && m_game_data_initialized) {
-        m_mods->on_draw_ui();
-    } else if (!m_game_data_initialized) {
-        ImGui::TextWrapped("REFramework is currently initializing...");
-        ImGui::TextWrapped("This menu will close after initialization if you have the remember option enabled.");
-    } else if (!m_error.empty()) {
-        ImGui::TextWrapped("REFramework error: %s", m_error.c_str());
-    }
-
-    m_last_window_pos = main_window->Pos;
-    m_last_window_size = main_window->Size;
-
-    track_manual_ui_layout_changes();
-
+    const bool is_open = draw_menu_window(false);
     ImGui::PopFont();
-    ImGui::End();
+    m_desk_menu.drawing = false;
+
+    // [ONI_MENU] Upstream: Positionsaenderungen der UEBRIGEN Fenster (Object
+    // Explorer ...) merken -- das Menuefenster selbst ist NoSavedSettings.
+    track_manual_ui_layout_changes();
 
     // save the menu state in config
     if (!is_open) {
@@ -1991,6 +2100,1712 @@ void REFramework::draw_ui() {
     if (m_last_draw_ui && !m_draw_ui) {
         m_windows_message_hook->window_toggle_cursor(m_cursor_state);
     }
+}
+
+// ============================================================================
+// [MENUE-SOUNDS 11.09.2026] ImGui-Test-Engine-Hooks (IMGUI_ENABLE_TEST_ENGINE in
+// re2_imconfig.hpp). ImGui ruft sie nur, solange TestEngineHookItems gesetzt
+// ist -- draw_menu_detail tut das nur fuer den rechten Bereich des Menues.
+// ============================================================================
+void ImGuiTestEngineHook_ItemAdd(ImGuiContext*, ImGuiID, const ImRect&, const ImGuiLastItemData*) {
+}
+
+void ImGuiTestEngineHook_ItemInfo(ImGuiContext* ctx, ImGuiID id, const char*, ImGuiItemStatusFlags flags) {
+    if (g_framework != nullptr) {
+        g_framework->on_imgui_item_info(ctx, id, flags);
+    }
+}
+
+void ImGuiTestEngineHook_Log(ImGuiContext*, const char*, ...) {
+}
+
+const char* ImGuiTestEngine_FindItemDebugLabel(ImGuiContext*, ImGuiID) {
+    return nullptr;
+}
+
+void REFramework::queue_menu_sound(MenuSound sound) {
+    std::scoped_lock _{m_menu_sound_mtx};
+
+    // Deckel: [ONI_MENU] in Onimusha holt (noch) niemand die Liste ab -- sie bleibt bei 16 stehen.
+    if (m_menu_sounds.size() < 16) {
+        m_menu_sounds.push_back(sound);
+    }
+}
+
+std::vector<REFramework::MenuSound> REFramework::take_menu_sounds() {
+    std::scoped_lock _{m_menu_sound_mtx};
+
+    std::vector<MenuSound> out{};
+    out.swap(m_menu_sounds);
+
+    return out;
+}
+
+// Erkennung je Widget. Ein Sound gibt es nur, wenn GENAU DIESES Widget in
+// DIESEM Kontext gerade bedient wurde (ActiveId / ActiveIdPreviousFrame). Sonst
+// wuerde ein Klick doppelt klingen: Desktop und VR zeichnen dieselben Werte, der
+// andere Kontext sieht den Zustandswechsel einen Frame spaeter ebenfalls.
+void REFramework::on_imgui_item_info(ImGuiContext* ctx, ImGuiID id, int flags) {
+    if (ctx == nullptr || id == 0) {
+        return;
+    }
+
+    const auto& g = *ctx;
+
+    // [MENUE-STEUERUNG 11.09.2026] Auch per Controller (Nav-Aktivierung) bedient.
+    const bool nav_pressed = g.NavActivatePressedId == id;
+    const bool operated = g.ActiveId == id || g.ActiveIdPreviousFrame == id || nav_pressed || g.NavActivateId == id;
+
+    // [SPALTENWECHSEL 11.09.2026] Nach "rechts" aus der Kategorien-Spalte: Cursor
+    // auf einen bedienbaren Eintrag im rechten Bereich. Der Hook laeuft direkt nach
+    // dem Widget, im richtigen Fenster -- genau der Kontext, den SetFocusID will.
+    // [SPALTENWECHSEL MERKEN 11.09.2026] Gibt es fuer die Kategorie einen gemerkten
+    // Eintrag, NUR diesen nehmen; den ersten bedienbaren nur als Fallback merken
+    // (eingeloest am Ende von draw_menu_detail, falls der gemerkte fehlt).
+    // [TASTATUR-NAVIGATION 16.09.2026] Gilt fuer den VR-Kontext (Controller) und
+    // fuer den Desktop, solange er das Menue zeichnet (Tastatur).
+    MenuNavState* const nav = (m_vr_menu.ctx != nullptr && ctx == m_vr_menu.ctx)
+        ? &m_vr_menu
+        : (m_desk_menu.drawing ? &m_desk_menu : nullptr);
+
+    if (nav != nullptr && nav->jump_to_detail && g.LastItemData.ID == id
+        && (g.LastItemData.ItemFlags & (ImGuiItemFlags_Disabled | ImGuiItemFlags_NoNav)) == 0) {
+        const auto cat = (size_t)m_menu_category;
+        const ImGuiID remembered = cat < MENU_CATEGORY_COUNT ? nav->detail_last_id[cat] : 0;
+
+        if (remembered == 0 || id == remembered) {
+            ImGui::SetFocusID(id, g.CurrentWindow);
+            ImGui::SetNavCursorVisible(true);
+            nav->jump_to_detail = false;
+        } else if (nav->detail_fallback_id == 0) {
+            nav->detail_fallback_id = id;
+            nav->detail_fallback_window = g.CurrentWindow;
+        }
+    }
+
+    // Fuer die Controller-/Tastatur-Steuerung merken, was unter dem Nav-Cursor liegt.
+    if (nav != nullptr && id == g.NavId) {
+        nav->frame_nav_item_flags = flags;
+    }
+
+    auto& states = m_menu_item_states[ctx];
+
+    // Kippt der gemerkte Zustand, waehrend das Widget bedient wird -> Sound.
+    // Erstes Auftauchen merkt nur den Zustand.
+    const auto flip = [&](uint8_t now) {
+        const auto it = states.find(id);
+        const bool changed = it != states.end() && it->second != now;
+        states[id] = now;
+        return changed && operated;
+    };
+
+    if ((flags & ImGuiItemStatusFlags_Openable) != 0) {
+        if (flip((flags & ImGuiItemStatusFlags_Opened) != 0 ? 1 : 0)) {
+            queue_menu_sound(MenuSound::Tree);
+        }
+
+        return;
+    }
+
+    if ((flags & ImGuiItemStatusFlags_Checkable) != 0) {
+        if (flip((flags & ImGuiItemStatusFlags_Checked) != 0 ? 1 : 0)) {
+            queue_menu_sound(MenuSound::Toggle);
+        }
+
+        return;
+    }
+
+    if ((flags & ImGuiItemStatusFlags_Inputable) != 0) {
+        // Slider/Drag: aktiv UND Wert hat sich in diesem Frame geaendert.
+        // Textfelder (ebenfalls Inputable) bleiben stumm.
+        if (g.ActiveId == id && g.ActiveIdHasBeenEditedThisFrame && g.InputTextState.ID != id) {
+            const auto now = std::chrono::steady_clock::now();
+
+            if (now - m_last_slider_sound >= std::chrono::milliseconds{50}) {
+                m_last_slider_sound = now;
+                queue_menu_sound(MenuSound::Slider);
+            }
+        }
+
+        return;
+    }
+
+    // Knoepfe (auch die Farb-, Headset- und Recoil-Wahl): Maus in diesem Frame
+    // losgelassen, das Widget war zuletzt aktiv und liegt noch unter der Maus --
+    // genau die Bedingung, unter der ImGui::Button true liefert.
+    if ((g.IO.MouseReleased[0] && g.ActiveIdPreviousFrame == id && g.HoveredId == id) || nav_pressed) {
+        queue_menu_sound(MenuSound::Toggle);
+    }
+}
+
+bool REFramework::draw_menu_window(bool vr) {
+    // [VOLLBILD 11.09.2026] Desktop wie VR: immer genau so gross wie die Anzeige
+    // des jeweiligen Kontexts (Desktop = Spielfenster, VR = VR_MENU_WIDTH x
+    // VR_MENU_HEIGHT), fest in der Ecke, weder zieh- noch einklappbar, ohne ini.
+    // Frueher hatte der Desktop feste 600 x 500 px.
+
+    // [TITEL 10.09.2026] Der Fenstertitel ist zugleich die ImGui-Fenster-ID.
+    // Beide Kontexte haben ihre eigene Fensterliste, gleicher Name stoert nicht.
+    // [ONI_MENU 26.09.2026] Titel des Menuefensters.
+    static const auto REF_NAME = std::string{"ONIMUSHA VR"};
+
+
+    // NoCollapse: ein eingeklapptes Fenster waere nur noch die Titelzeile.
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse;
+    bool is_open = true;
+
+    ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize, ImGuiCond_Always);
+    flags |= ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings;
+
+    // [VOLLBILD 11.09.2026] Massstab des Menues. VR: 1 (die Textur ist 1080 px
+    // hoch). Desktop: Hoehe des Spielfensters / 1080 -- bei 1080p sieht der
+    // Desktop also exakt aus wie das VR-Menue, bei 4K alles doppelt so gross.
+    // Die Regler "Category/Content Text Size" wirken obendrauf, in beiden.
+    // 0 = ungeskaliert (nur solange die Schriften noch nicht gebaut sind).
+    const bool fonts_ready = m_vr_font_base != nullptr && m_vr_font_heading != nullptr && m_vr_font_nav != nullptr;
+
+    if (!fonts_ready) {
+        m_menu_draw_scale = 0.0f;
+    } else if (vr) {
+        m_menu_draw_scale = 1.0f;
+    } else {
+        m_menu_draw_scale = std::max(ImGui::GetIO().DisplaySize.y / VR_MENU_HEIGHT, 0.25f);
+    }
+
+    // [TITELFARBE 10.09.2026] ImGui hat KEINEN eigenen Farbslot fuer den
+    // Titeltext -- der Titelbalken zeichnet mit ImGuiCol_Text. Deshalb die
+    // Textfarbe genau fuer den Moment des Begin() umstellen.
+    ImGui::PushStyleColor(ImGuiCol_Text, menu_accent(0.87f));   // [ONI_MENU] Akzent statt Blau
+
+    // Nur der Desktop bekommt den Schliessen-Knopf; in VR geht das Menue ueber
+    // LT + linkes B (run_vr_menu_frame) bzw. Insert zu.
+    ImGui::Begin(REF_NAME.c_str(), vr ? nullptr : &is_open, flags);
+
+    ImGui::PopStyleColor();
+
+    // [MENUE-KATEGORIEN 11.09.2026] Links die Kategorien, rechts ihr Inhalt.
+    // Die gewaehlte Kategorie (m_menu_category) teilen sich beide Kontexte.
+    draw_menu_nav();
+    // [ABSTAND SPALTEN 11.09.2026] Mehr Luft zwischen der Trennlinie der linken
+    // Spalte und dem Inhalt rechts (vorher nur ItemSpacing.x) -- mitskaliert wie
+    // das ganze Menue (1 bei 1080 px).
+    ImGui::SameLine(0.0f, MENU_DETAIL_GAP * (m_menu_draw_scale > 0.0f ? m_menu_draw_scale : 1.0f));
+    draw_menu_detail();
+
+    // Nur das Desktop-Fenster: OverlayComponent rechnet unter D3D11 noch damit.
+    if (!vr) {
+        m_last_window_pos = ImGui::GetWindowPos();
+        m_last_window_size = ImGui::GetWindowSize();
+    }
+
+    ImGui::End();
+
+    m_menu_draw_scale = 0.0f;
+
+    return is_open;
+}
+
+// ============================================================================
+// [VR-MENUE-KONTEXT 11.09.2026] Ein Frame des VR-Menues.
+//
+// Eigener ImGui-Kontext mit fester Displaygroesse, OHNE Plattform-Backend:
+// Groesse, Zeit und Maus (= Laser) setzen wir selbst. Schriftatlas und
+// DX12-Renderer kommen vom Desktop-Kontext -- der Atlas wird geteilt, der
+// Renderer ist REFrameworks zweites DX12-Backend (imgui_backend_datas[1]), das
+// schon immer ins VR-Rendertarget RTV::IMGUI gezeichnet hat.
+// ============================================================================
+void REFramework::run_vr_menu_frame() {
+    m_vr_menu.has_draw_data = false;
+
+    auto& vr = VR::get();
+
+    // [ONI_MENU 26.09.2026] LT + linkes B -> Menue auf/zu (Flanke), ROH gelesen --
+    // bei offenem Menue liefern die normalen Lesewege nichts. In RE4/RE9 macht das
+    // das Bindings-Modul des Mods; Onimusha hat keins, deshalb hier. Das alte
+    // Oeffnen durch Zielen auf die Hand-Flaeche ist mit OverlayComponent entfallen.
+    {
+        const bool combo = vr->is_hmd_active()
+                           && vr->is_action_active_raw(vr->get_action_trigger(), vr->get_left_joystick())
+                           && vr->is_action_active_raw(vr->get_action_b_button(), vr->get_left_joystick());
+
+        if (combo && !m_vr_menu.open_combo_prev) {
+            set_draw_ui(!m_draw_ui);
+        }
+
+        m_vr_menu.open_combo_prev = combo;
+    }
+
+    // [MENUE-STEUERUNG 11.09.2026] Menue gerade zugegangen -> das Spiel bleibt
+    // stumm, bis alle Tasten los und die Sticks mittig sind. Sonst kaeme das
+    // gerade gehaltene A, der Trigger oder der Stick sofort beim Spiel an.
+    const bool just_opened = m_draw_ui && !m_vr_menu.was_open;
+
+    if (m_vr_menu.was_open && !m_draw_ui) {
+        vr->set_menu_release_guard(true);
+    }
+
+    m_vr_menu.was_open = m_draw_ui;
+
+    if (vr->is_menu_release_guard()) {
+        const auto held = [&](vr::VRActionHandle_t action) {
+            return vr->is_action_active_raw(action, vr->get_left_joystick())
+                   || vr->is_action_active_raw(action, vr->get_right_joystick());
+        };
+
+        const bool any_held = held(vr->get_action_a_button()) || held(vr->get_action_b_button())
+                              || held(vr->get_action_trigger()) || held(vr->get_action_grip())
+                              || held(vr->get_action_joystick_click()) || held(vr->get_action_weapon_dial())
+                              || glm::length(vr->get_left_stick_axis_raw()) > 0.35f
+                              || glm::length(vr->get_right_stick_axis_raw()) > 0.35f;
+
+        if (!vr->is_hmd_active() || !any_held) {
+            vr->set_menu_release_guard(false);
+        }
+    }
+
+    if (just_opened) {
+        m_vr_menu.jump_to_nav = true;   // Cursor auf die gewaehlte Kategorie
+        m_vr_menu.tweaking = false;
+        m_vr_menu.dir_prev = 0;
+        m_vr_menu.l_a_prev = true;      // erst loslassen, dann zaehlt "zurueck"
+        m_vr_menu.scroll_delta = 0.0f;
+    }
+
+    const bool wanted = m_initialized && m_draw_ui
+                        && m_renderer_type == RendererType::D3D12
+                        && m_d3d12.imgui_backend_datas[1] != nullptr
+                        && vr->is_hmd_active();
+
+    if (!wanted) {
+        return;
+    }
+
+    const auto main_ctx = ImGui::GetCurrentContext();
+
+    if (main_ctx == nullptr) {
+        return;
+    }
+
+    // Werte des Desktop-Kontexts VOR dem Umschalten mitnehmen.
+    auto* const atlas = ImGui::GetIO().Fonts;
+    const auto delta_time = ImGui::GetIO().DeltaTime;
+    // [RE9 / ImGui 1.92] Der Atlas ist geteilt -- beide Kontexte MUESSEN beim
+    // Flag RendererHasTextures uebereinstimmen (Assert in ImGui::NewFrame).
+    const auto main_backend_flags = ImGui::GetIO().BackendFlags;
+    const auto style = ImGui::GetStyle();
+
+    // Der Desktop-Kontext kann bei einer Neuinitialisierung neu entstehen --
+    // dann gehoert der geteilte Atlas zu ihm, und der VR-Kontext wird neu gebaut.
+    if (m_vr_menu.ctx != nullptr && m_vr_menu.atlas != atlas) {
+        ImGui::DestroyContext(m_vr_menu.ctx);
+        m_vr_menu.ctx = nullptr;
+    }
+
+    if (m_vr_menu.ctx == nullptr) {
+        m_vr_menu.ctx = ImGui::CreateContext(atlas);   // stellt den aktuellen Kontext selbst wieder her
+        m_vr_menu.atlas = atlas;
+    }
+
+    ImGui::SetCurrentContext(m_vr_menu.ctx);
+    ImNodes::SetImGuiContext(m_vr_menu.ctx);   // falls ein Tree ImNodes nutzt
+
+    auto& io = ImGui::GetIO();
+    io.IniFilename = nullptr;   // keine ini -- das Fenster ist fest
+    io.LogFilename = nullptr;
+    io.DisplaySize = ImVec2{VR_MENU_WIDTH, VR_MENU_HEIGHT};
+    io.DisplayFramebufferScale = ImVec2{1.0f, 1.0f};
+    io.DeltaTime = delta_time > 0.0f ? delta_time : (1.0f / 90.0f);
+    io.BackendFlags |= ImGuiBackendFlags_RendererHasVtxOffset;
+    io.BackendFlags |= (main_backend_flags & ImGuiBackendFlags_RendererHasTextures);
+    io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;   // [MENUE-STEUERUNG] Controller-Navigation
+    io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
+
+    // [STICK-WIEDERHOLUNG 11.09.2026] ImGui rechnet fuers Weiterspringen mit
+    // Delay x 0.72 und Rate x 0.80 -- zurueckgerechnet, damit die Regler genau
+    // die Sekunden fuer den Cursor-Sprung einstellen.
+    io.KeyRepeatDelay = m_vr_menu_repeat_delay / 0.72f;
+    io.KeyRepeatRate = m_vr_menu_repeat_interval / 0.80f;
+
+    // Theme vom Desktop uebernehmen (auch Aenderungen aus dem Style Editor),
+    // aber ohne dessen Fokus-Transparenz.
+    ImGui::GetStyle() = style;
+    ImGui::GetStyle().Alpha = 1.0f;
+
+    // ---------------------------------------------------------------------
+    // [MENUE-STEUERUNG 11.09.2026] Controller statt Laser, ueber ImGuis
+    // Gamepad-Navigation. Gelesen wird ROH (is_action_active_raw) -- die normalen
+    // Lesewege liefern bei offenem Menue nichts, damit das Spiel stillhaelt.
+    //   linker Stick   hoch/runter = Eintrag, links/rechts = Zeile bzw. Spalte
+    //   rechter Stick  hoch/runter = scrollen, links/rechts = markierten Slider
+    //   rechtes A      auswaehlen (Toggle, Knopf, Tree, Kategorie)
+    //   linkes A (X)   zurueck: Popup/Slider verlassen -> Kategorie links -> Menue zu
+    // ---------------------------------------------------------------------
+    io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);   // keine Maus im VR-Menue
+
+    const auto& g = *m_vr_menu.ctx;
+
+    // Was im LETZTEN Frame unter dem Nav-Cursor lag (on_imgui_item_info).
+    const int nav_flags = m_vr_menu.nav_item_flags;
+    const bool nav_in_column = m_vr_menu.nav_window != nullptr
+                               && g.NavWindow == static_cast<ImGuiWindow*>(m_vr_menu.nav_window);
+
+    // [CURSOR-SOUND 12.09.2026] Ein Ton, sobald die Markierung auf einen anderen
+    // Eintrag wandert. Der erste Wechsel nach dem Oeffnen (vorher 0) bleibt stumm --
+    // dort klingt schon der Oeffnen-Ton.
+    if (g.NavId != m_vr_menu.nav_prev_id) {
+        if (m_vr_menu.nav_prev_id != 0 && g.NavId != 0) {
+            queue_menu_sound(MenuSound::Cursor);
+        }
+
+        m_vr_menu.nav_prev_id = g.NavId;
+    }
+
+    auto ls = vr->get_left_stick_axis_raw();
+    auto rs = vr->get_right_stick_axis_raw();
+    bool r_a = vr->is_action_active_raw(vr->get_action_a_button(), vr->get_right_joystick());
+    bool l_a = vr->is_action_active_raw(vr->get_action_a_button(), vr->get_left_joystick());
+
+    // [ONI_PAD] Xbox-Pad wie die VR-Controller: linker Stick/Steuerkreuz = linker Stick,
+    // rechter Stick = rechter Stick, A = rechtes A (auswaehlen), B = linkes A (zurueck).
+    if (std::abs(m_pad_ls[0]) + std::abs(m_pad_ls[1]) > std::abs(ls.x) + std::abs(ls.y)) {
+        ls.x = m_pad_ls[0];
+        ls.y = m_pad_ls[1];
+    }
+
+    if (std::abs(m_pad_rs[0]) + std::abs(m_pad_rs[1]) > std::abs(rs.x) + std::abs(rs.y)) {
+        rs.x = m_pad_rs[0];
+        rs.y = m_pad_rs[1];
+    }
+
+    r_a = r_a || m_pad_a;
+    l_a = l_a || m_pad_b;
+
+    // [SLIDER FESTHALTEN 11.09.2026] Mit rechtem A aktivierter Slider: solange er aktiv
+    // ist, holt NICHTS ausser linkem A aus dem Verstellen heraus -- kein Stick hoch/runter,
+    // kein zweites rechtes A, kein Spaltenwechsel. (Der Schnellweg "rechter Stick ohne A"
+    // laeuft ueber m_vr_menu.tweaking und ist davon getrennt.)
+    const bool slider_held = !m_vr_menu.tweaking && g.ActiveId != 0 && g.ActiveId == g.NavId
+                             && (nav_flags & ImGuiItemStatusFlags_Inputable) != 0;
+
+    // Linker Stick -> EINE Richtung (die staerkere Achse), mit Hysterese.
+    // 0 = keine, 1 = hoch, 2 = runter, 3 = links, 4 = rechts. Wiederholung beim
+    // Halten uebernimmt ImGui selbst.
+    // [STICK-DEADZONE 11.09.2026] Schwelle aus dem Menu Editor ("Stick Deadzone").
+    // Loslassen erst unter 65 % davon (Hysterese), damit es an der Kante nicht flattert.
+    const float dz = m_vr_menu_stick_deadzone;
+    const float dz_keep = dz * 0.65f;
+
+    const auto still_held = [&](int d) {
+        switch (d) {
+        case 1: return ls.y > dz_keep;
+        case 2: return ls.y < -dz_keep;
+        case 3: return ls.x < -dz_keep;
+        case 4: return ls.x > dz_keep;
+        default: return false;
+        }
+    };
+
+    int dir = 0;
+
+    if (m_vr_menu.dir_prev > 0 && still_held(m_vr_menu.dir_prev)) {
+        dir = m_vr_menu.dir_prev;
+    } else if (std::abs(ls.y) >= std::abs(ls.x)) {
+        dir = ls.y > dz ? 1 : (ls.y < -dz ? 2 : 0);
+    } else {
+        dir = ls.x < -dz ? 3 : (ls.x > dz ? 4 : 0);
+    }
+
+    const bool dir_edge = dir != 0 && dir != m_vr_menu.dir_prev;
+    m_vr_menu.dir_prev = dir;
+
+    bool dpad_up = dir == 1;
+    bool dpad_down = dir == 2;
+    bool dpad_left = dir == 3;
+    bool dpad_right = dir == 4;
+    bool face_down_pulse = false;
+    bool face_right_pulse = false;
+    bool close_menu = false;
+
+    // Links/rechts auf einem Tree NICHT an ImGui geben -- ImGui klappt Trees damit
+    // auf/zu, bei uns tut das nur A. Links springt stattdessen zur Kategorie.
+    if ((nav_flags & ImGuiItemStatusFlags_Openable) != 0 && !m_vr_menu.tweaking) {
+        if (dpad_left && dir_edge) {
+            m_vr_menu.jump_to_nav = true;
+        }
+
+        dpad_left = false;
+        dpad_right = false;
+    }
+
+    // Rechter Stick links/rechts auf einem Slider: A-Impuls aktiviert ihn, dann
+    // verstellt ImGui ihn mit links/rechts; Stick zurueck -> A-Impuls = fertig.
+    if (!m_vr_menu.tweaking) {
+        const bool on_slider = (nav_flags & ImGuiItemStatusFlags_Inputable) != 0;
+
+        if (on_slider && std::abs(rs.x) > dz && g.ActiveId == 0) {
+            face_down_pulse = true;
+            m_vr_menu.tweaking = true;
+        } else if (!on_slider && dir == 0 && std::abs(rs.x) > dz && std::abs(rs.x) > std::abs(rs.y)) {
+            // [11.09.2026] Ausserhalb von Slidern wechselt auch der RECHTE Stick
+            // links/rechts Zeile bzw. Spalte -- wie der linke. Auf einem Tree gilt
+            // dieselbe Regel: links = zur Kategorie, rechts = nichts.
+            if ((nav_flags & ImGuiItemStatusFlags_Openable) != 0) {
+                if (rs.x < 0.0f) {
+                    m_vr_menu.jump_to_nav = true;
+                }
+            } else {
+                dpad_left = rs.x < 0.0f;
+                dpad_right = rs.x > 0.0f;
+            }
+        }
+    } else if (std::abs(rs.x) < dz * 0.55f) {
+        if (g.ActiveId != 0) {
+            face_down_pulse = true;
+        }
+
+        m_vr_menu.tweaking = false;
+    } else {
+        dpad_up = false;
+        dpad_down = false;
+        dpad_left = rs.x < 0.0f;
+        dpad_right = rs.x > 0.0f;
+    }
+
+    // [SPALTENWECHSEL 11.09.2026] ImGuis Richtungsnavigation nimmt fuer links/rechts
+    // nur Kandidaten auf GLEICHER HOEHE (NavScoreItem bestimmt den Quadranten aus dem
+    // Abstand; alles deutlich darunter zaehlt als "unten"). Neben einer Kategorie
+    // steht rechts meist nur Text -- deshalb ging es bisher nur bei "Developer", wo
+    // der erste Header auf Hoehe der Kategorie liegt. Jetzt selbst:
+    //   Kategorien-Spalte + rechts         -> erster bedienbarer Eintrag rechts, ganz oben
+    //   rechter Bereich + links, nichts da -> zurueck zur gewaehlten Kategorie
+    const bool rs_left_now = !m_vr_menu.tweaking && rs.x < -dz && std::abs(rs.x) > std::abs(rs.y);
+    const bool rs_left_edge = rs_left_now && !m_vr_menu.rs_left_prev;
+    m_vr_menu.rs_left_prev = rs_left_now;
+
+    if (nav_in_column && dpad_right && !m_vr_menu.tweaking) {
+        m_vr_menu.jump_to_detail = true;   // eingeloest in on_imgui_item_info
+        dpad_right = false;
+    }
+
+    // Links gedrueckt und nach 3 Frames steht der Cursor noch am selben Eintrag:
+    // ImGui hat links nichts gefunden -> zur Kategorie springen.
+    if (m_vr_menu.left_probe_frames > 0 && --m_vr_menu.left_probe_frames == 0) {
+        if (!nav_in_column && g.NavId == m_vr_menu.left_probe_id) {
+            m_vr_menu.jump_to_nav = true;
+        }
+    }
+
+    if (!nav_in_column && dpad_left && !m_vr_menu.tweaking && !slider_held && ((dir == 3 && dir_edge) || rs_left_edge)) {
+        m_vr_menu.left_probe_id = g.NavId;
+        m_vr_menu.left_probe_frames = 3;
+    }
+
+    // Rechter Stick hoch/runter: scrollen (verbraucht in draw_menu_detail).
+    // [ONI_MENU] Ohne den Reiter "Bindings" (RE9: dort fest 0.3) gilt ueberall dz * 0.6.
+    const float scroll_dz = dz * 0.6f;
+
+    if (!m_vr_menu.tweaking && std::abs(rs.y) > scroll_dz && std::abs(rs.y) >= std::abs(rs.x)) {
+        // [SCROLLTEMPO 14.09.2026] Feste 900 px/s standen hier -- jetzt der
+        // Regler aus dem Menu Editor.
+        m_vr_menu.scroll_delta += rs.y * m_vr_menu_scroll_speed * io.DeltaTime;
+    }
+
+    // [TRACKPAD 15.09.2026 -- Ansage des Users] Auf den Valve Knuckles auch mit
+    // dem RECHTEN TRACKPAD scrollen. HIER ist die richtige Stelle: das VR-Menue
+    // unter D3D12 laeuft ueber diesen Frame, nicht ueber OverlayComponent
+    // (update_pointer steigt bei D3D12 in der ersten Zeile aus -- deshalb kam
+    // vom Trackpad nichts an, obwohl die Achse sauber Werte liefert).
+    // Dieselbe Schwelle und dasselbe Tempo wie beim Stick; wer kein Trackpad
+    // hat, bekommt 0 und merkt nichts.
+    if (!m_vr_menu.tweaking) {
+        const auto tp = vr->get_right_touchpad_axis();
+
+        if (std::abs(tp.y) > scroll_dz && std::abs(tp.y) >= std::abs(tp.x)) {
+            m_vr_menu.scroll_delta +=
+                tp.y * m_vr_menu_scroll_speed * m_vr_menu_trackpad_scale * io.DeltaTime;
+        }
+    }
+
+    // Linkes A (X): zurueck.
+    const bool l_a_edge = l_a && !m_vr_menu.l_a_prev;
+    m_vr_menu.l_a_prev = l_a;
+
+    if (l_a_edge) {
+        if (m_vr_menu.tweaking || g.ActiveId != 0 || ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopup)) {
+            face_right_pulse = true;
+            m_vr_menu.tweaking = false;
+        } else if (nav_in_column) {
+            close_menu = true;
+        } else {
+            m_vr_menu.jump_to_nav = true;
+        }
+    }
+
+    // [SLIDER FESTHALTEN 11.09.2026] Aktiver Slider: nur noch links/rechts (von beiden
+    // Sticks) zum Verstellen, hoch/runter gehen NICHT an ImGui -- sonst wanderte der
+    // Cursor weg und beendete das Verstellen. Links-A (oben) bleibt der einzige Ausweg.
+    if (slider_held) {
+        const bool rs_horizontal = std::abs(rs.x) > dz && std::abs(rs.x) > std::abs(rs.y);
+
+        dpad_up = false;
+        dpad_down = false;
+        dpad_left = dir == 3 || (rs_horizontal && rs.x < 0.0f);
+        dpad_right = dir == 4 || (rs_horizontal && rs.x > 0.0f);
+        m_vr_menu.jump_to_nav = m_vr_menu.jump_to_nav && close_menu;   // kein Rausspringen
+        m_vr_menu.jump_to_detail = false;
+    }
+
+    // [KATEGORIE-RAND 11.09.2026] Links am Rand nicht weiterlaufen lassen.
+    if (nav_in_column) {
+        if (dpad_up && g.NavId == m_vr_menu.nav_first_id) {
+            dpad_up = false;
+        }
+
+        if (dpad_down && g.NavId == m_vr_menu.nav_last_id) {
+            dpad_down = false;
+        }
+    }
+
+    // Impulse gehen EINEN Frame als "gedrueckt" raus; im Frame danach bleibt A
+    // einmal "los", damit ImGui die naechste Flanke sieht.
+    io.AddKeyEvent(ImGuiKey_GamepadDpadUp, dpad_up);
+    io.AddKeyEvent(ImGuiKey_GamepadDpadDown, dpad_down);
+    io.AddKeyEvent(ImGuiKey_GamepadDpadLeft, dpad_left);
+    io.AddKeyEvent(ImGuiKey_GamepadDpadRight, dpad_right);
+    io.AddKeyEvent(ImGuiKey_GamepadFaceDown,
+                   face_down_pulse || (r_a && !m_vr_menu.face_down_pulse_prev && !m_vr_menu.tweaking && !slider_held));
+    io.AddKeyEvent(ImGuiKey_GamepadFaceRight, face_right_pulse);
+    m_vr_menu.face_down_pulse_prev = face_down_pulse;
+
+    ImGui::NewFrame();
+
+    m_vr_menu.drawing = true;
+    draw_menu_window(true);
+    m_vr_menu.drawing = false;
+
+    ImGui::EndFrame();
+    ImGui::Render();
+
+    m_vr_menu.has_draw_data = true;
+
+    // Nav-Info fuer den naechsten Frame uebernehmen.
+    m_vr_menu.nav_item_flags = m_vr_menu.frame_nav_item_flags;
+    m_vr_menu.frame_nav_item_flags = 0;
+
+    ImNodes::SetImGuiContext(main_ctx);
+    ImGui::SetCurrentContext(main_ctx);
+
+    // "Zurueck" in der Kategorien-Spalte: Menue zu -- erst NACH dem Kontextwechsel.
+    if (close_menu) {
+        set_draw_ui(false);
+    }
+}
+
+// ============================================================================
+// [TASTATUR-NAVIGATION 16.09.2026 -- Ansage des Users] Desktop-Menue per Tastatur.
+//
+// Dieselben Regeln wie der Controller im VR-Menue (run_vr_menu_frame), nur mit
+// Tasten statt Sticks:
+//   Pfeiltasten  Eintrag (hoch/runter) bzw. Zeile/Spalte (links/rechts)
+//   Leertaste    auswaehlen (Toggle, Knopf, Tree, Kategorie, Slider aktivieren)
+//   Backspace    zurueck: Slider/Popup verlassen -> Kategorie links -> Menue zu
+//
+// Bewusst ueber ImGuis TASTATUR-Navigation und nicht ueber den Gamepad-Weg: das
+// Win32-Backend liest das XInput-Pad (auch das virtuelle ViGEm-Pad) immer mit --
+// mit eingeschalteter Gamepad-Navigation wuerde das Spiel-Pad im Menue wandern.
+// Die echten Nachrichten der sechs Tasten haelt on_message von ImGui fern
+// (ausser ein Textfeld ist aktiv); hier gehen sie nach den Regeln hinein.
+// ============================================================================
+void REFramework::run_desk_menu_keyboard() {
+    auto& io = ImGui::GetIO();
+    auto& m = m_desk_menu;
+
+    const bool just_opened = m_draw_ui && !m.was_open;
+    m.was_open = m_draw_ui;
+
+    const auto& k = m_last_keys;
+
+    // [ONI_PAD] Xbox-Pad (XInput) wie die Pfeiltasten: Steuerkreuz/linker Stick = Richtung,
+    // A = auswaehlen, B = zurueck, LB+RB = Menue auf/zu. Onimusha hat kein ViGEm-Pad, das doppelt ankaeme.
+    // Das Spiel liest das Pad ueber xinput1_4 -> XInputGetState gehookt: bei offenem Menue (und bis alles
+    // losgelassen ist) bekommt das Spiel ein leeres Pad; das Menue liest ueber das Original.
+    bool pad_up{}, pad_down{}, pad_left{}, pad_right{}, pad_a{}, pad_b{}, pad_lb{}, pad_rb{}, pad_any{};
+    float pad_ls[2]{}, pad_rs[2]{};
+    bool pad_recenter{};
+    {
+        using XInputGetStateFn = DWORD(WINAPI*)(DWORD, XINPUT_STATE*);
+        static std::unique_ptr<FunctionHook> s_xinput_hook{};
+        static auto xinput_get_state = []() -> XInputGetStateFn {
+            for (auto dll : {L"xinput1_4.dll", L"xinput1_3.dll", L"xinput9_1_0.dll"}) {
+                if (auto mod = LoadLibraryW(dll); mod != nullptr) {
+                    if (auto fn = (XInputGetStateFn)GetProcAddress(mod, "XInputGetState"); fn != nullptr) {
+                        static XInputGetStateFn s_original{};
+                        const XInputGetStateFn hook_fn = [](DWORD idx, XINPUT_STATE* st) -> DWORD {
+                            const auto r = s_original(idx, st);
+
+                            if (r == ERROR_SUCCESS && st != nullptr && g_framework != nullptr && g_framework->is_pad_blocked_for_game()) {
+                                st->Gamepad = XINPUT_GAMEPAD{};
+                            }
+
+                            // [ONI_RECENTER] beide Stick-Klicks gehoeren dem Recenter -> nicht ans Spiel
+                            constexpr WORD recenter_bits = XINPUT_GAMEPAD_LEFT_THUMB | XINPUT_GAMEPAD_RIGHT_THUMB;
+                            if (r == ERROR_SUCCESS && st != nullptr && (st->Gamepad.wButtons & recenter_bits) == recenter_bits) {
+                                st->Gamepad.wButtons &= ~recenter_bits;
+                            }
+
+                            return r;
+                        };
+
+                        s_xinput_hook = std::make_unique<FunctionHook>((uintptr_t)fn, (uintptr_t)hook_fn);
+
+                        if (s_xinput_hook->create()) {
+                            s_original = s_xinput_hook->get_original<DWORD WINAPI(DWORD, XINPUT_STATE*)>();
+                            return s_original;
+                        }
+
+                        s_xinput_hook.reset();
+                        return fn;
+                    }
+                }
+            }
+            return nullptr;
+        }();
+
+        if (xinput_get_state != nullptr) {
+            for (DWORD i = 0; i < 4; ++i) {
+                XINPUT_STATE st{};
+
+                if (xinput_get_state(i, &st) != ERROR_SUCCESS) {
+                    continue;
+                }
+
+                const auto& gp = st.Gamepad;
+                constexpr SHORT stick_dz = 16000;
+                pad_up = pad_up || (gp.wButtons & XINPUT_GAMEPAD_DPAD_UP) != 0 || gp.sThumbLY > stick_dz;
+                pad_down = pad_down || (gp.wButtons & XINPUT_GAMEPAD_DPAD_DOWN) != 0 || gp.sThumbLY < -stick_dz;
+                pad_left = pad_left || (gp.wButtons & XINPUT_GAMEPAD_DPAD_LEFT) != 0 || gp.sThumbLX < -stick_dz;
+                pad_right = pad_right || (gp.wButtons & XINPUT_GAMEPAD_DPAD_RIGHT) != 0 || gp.sThumbLX > stick_dz;
+                pad_a = pad_a || (gp.wButtons & XINPUT_GAMEPAD_A) != 0;
+                pad_b = pad_b || (gp.wButtons & XINPUT_GAMEPAD_B) != 0;
+                // fuers VR-Menue (run_vr_menu_frame): Sticks normiert, Steuerkreuz = voller Ausschlag
+                {
+                    float lx = gp.sThumbLX / 32767.0f, ly = gp.sThumbLY / 32767.0f;
+                    if (gp.wButtons & XINPUT_GAMEPAD_DPAD_UP) ly = 1.0f;
+                    if (gp.wButtons & XINPUT_GAMEPAD_DPAD_DOWN) ly = -1.0f;
+                    if (gp.wButtons & XINPUT_GAMEPAD_DPAD_LEFT) lx = -1.0f;
+                    if (gp.wButtons & XINPUT_GAMEPAD_DPAD_RIGHT) lx = 1.0f;
+                    if (std::abs(lx) + std::abs(ly) > std::abs(pad_ls[0]) + std::abs(pad_ls[1])) { pad_ls[0] = lx; pad_ls[1] = ly; }
+                    const float rx = gp.sThumbRX / 32767.0f, ry = gp.sThumbRY / 32767.0f;
+                    if (std::abs(rx) + std::abs(ry) > std::abs(pad_rs[0]) + std::abs(pad_rs[1])) { pad_rs[0] = rx; pad_rs[1] = ry; }
+                }
+                pad_recenter = pad_recenter || (gp.wButtons & (XINPUT_GAMEPAD_LEFT_THUMB | XINPUT_GAMEPAD_RIGHT_THUMB)) == (XINPUT_GAMEPAD_LEFT_THUMB | XINPUT_GAMEPAD_RIGHT_THUMB);
+                pad_lb = pad_lb || (gp.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER) != 0;
+                pad_rb = pad_rb || (gp.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) != 0;
+                pad_any = pad_any || gp.wButtons != 0 || gp.bLeftTrigger > 30 || gp.bRightTrigger > 30
+                          || std::abs((int)gp.sThumbLX) > 8000 || std::abs((int)gp.sThumbLY) > 8000
+                          || std::abs((int)gp.sThumbRX) > 8000 || std::abs((int)gp.sThumbRY) > 8000;
+            }
+        }
+
+        m_pad_ls[0] = pad_ls[0]; m_pad_ls[1] = pad_ls[1];
+        m_pad_rs[0] = pad_rs[0]; m_pad_rs[1] = pad_rs[1];
+        m_pad_a = pad_a;
+        m_pad_b = pad_b;
+
+        // [ONI_RECENTER] beide Sticks druecken (L3+R3) = REFramework "Recenter View" (Flanke)
+        static bool s_recenter_prev{false};
+
+        if (pad_recenter && !s_recenter_prev) {
+            if (auto& vr = VR::get(); vr != nullptr && vr->is_hmd_active()) {
+                vr->recenter_view();
+            }
+        }
+
+        s_recenter_prev = pad_recenter;
+
+        // LB+RB = Menue auf/zu (Flanke)
+        static bool s_combo_prev{false};
+        const bool combo = pad_lb && pad_rb;
+
+        if (combo && !s_combo_prev) {
+            std::lock_guard _{m_input_mutex};
+            set_draw_ui(!m_draw_ui);
+        }
+
+        s_combo_prev = combo;
+
+        // Sperre fuers Spiel: Menue offen, oder nach dem Schliessen bis das Pad losgelassen ist
+        if (m_draw_ui) {
+            m_pad_release_guard = true;
+        } else if (!pad_any) {
+            m_pad_release_guard = false;
+        }
+    }
+
+    // Mit Headset geht das Pad NUR ins VR-Menue (run_vr_menu_frame), sonst doppelt:
+    // beide Menues zeichnen dieselben Schalter -> ein A-Druck schaltet zweimal (AFR liess sich nicht abwaehlen).
+    const bool pad_to_desk = !(VR::get() != nullptr && VR::get()->is_hmd_active());
+
+    const bool key_up = k[VK_UP] != 0 || (pad_to_desk && pad_up);
+    const bool key_down = k[VK_DOWN] != 0 || (pad_to_desk && pad_down);
+    const bool key_left = k[VK_LEFT] != 0 || (pad_to_desk && pad_left);
+    const bool key_right = k[VK_RIGHT] != 0 || (pad_to_desk && pad_right);
+    const bool key_select = k[VK_SPACE] != 0 || (pad_to_desk && pad_a);
+    const bool key_back = k[VK_BACK] != 0 || (pad_to_desk && pad_b);
+
+    // [ONI_MENU] Kein Begruessungs-Splash (wie RE9).
+    const bool splash = false;
+
+    // Menue zu, Begruessung laeuft oder ein Textfeld tippt: nichts einspeisen.
+    // Nur eine noch "gedrueckt" gemeldete Taste einmal loslassen.
+    if (!m_draw_ui || splash || io.WantTextInput) {
+        if (!m_draw_ui) {
+            io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
+        }
+
+        if (m.dir_prev != 0 || m.key_select_prev) {
+            io.AddKeyEvent(ImGuiKey_UpArrow, false);
+            io.AddKeyEvent(ImGuiKey_DownArrow, false);
+            io.AddKeyEvent(ImGuiKey_LeftArrow, false);
+            io.AddKeyEvent(ImGuiKey_RightArrow, false);
+            io.AddKeyEvent(ImGuiKey_Space, false);
+        }
+
+        if (m.cancel_pulse_prev) {
+            io.AddKeyEvent(ImGuiKey_Escape, false);
+        }
+
+        m.dir_prev = 0;
+        m.key_select_prev = false;
+        m.key_back_prev = key_back;
+        m.cancel_pulse_prev = false;
+        m.left_probe_frames = 0;
+        return;
+    }
+
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+
+    if (just_opened) {
+        m.jump_to_nav = false;
+        m.jump_to_detail = false;
+        m.dir_prev = 0;
+        m.key_back_prev = key_back;   // erst loslassen, dann zaehlt "zurueck"
+        m.left_probe_frames = 0;
+    }
+
+    const auto& g = *ImGui::GetCurrentContext();
+
+    // Was im LETZTEN Frame unter dem Nav-Cursor lag (on_imgui_item_info).
+    const int nav_flags = m.nav_item_flags;
+    const bool nav_in_column = m.nav_window != nullptr
+                               && g.NavWindow == static_cast<ImGuiWindow*>(m.nav_window);
+    const bool slider_held = g.ActiveId != 0 && g.ActiveId == g.NavId
+                             && (nav_flags & ImGuiItemStatusFlags_Inputable) != 0;
+
+    // EINE Richtung: die schon gehaltene bleibt, sonst die zuerst gefundene.
+    // 0 = keine, 1 = hoch, 2 = runter, 3 = links, 4 = rechts. Wiederholung beim
+    // Halten uebernimmt ImGui selbst.
+    const auto held = [&](int d) {
+        switch (d) {
+        case 1: return key_up;
+        case 2: return key_down;
+        case 3: return key_left;
+        case 4: return key_right;
+        default: return false;
+        }
+    };
+
+    int dir = 0;
+
+    if (m.dir_prev > 0 && held(m.dir_prev)) {
+        dir = m.dir_prev;
+    } else if (key_up) {
+        dir = 1;
+    } else if (key_down) {
+        dir = 2;
+    } else if (key_left) {
+        dir = 3;
+    } else if (key_right) {
+        dir = 4;
+    }
+
+    const bool dir_edge = dir != 0 && dir != m.dir_prev;
+    m.dir_prev = dir;
+
+    // [CURSOR-SOUND] Wie im VR-Menue -- aber nur, wenn eine Pfeiltaste den Cursor
+    // bewegt hat (ein Mausklick setzt die NavId ebenfalls).
+    if (g.NavId != m.nav_prev_id) {
+        if (m.nav_prev_id != 0 && g.NavId != 0 && dir != 0) {
+            queue_menu_sound(MenuSound::Cursor);
+        }
+
+        m.nav_prev_id = g.NavId;
+    }
+
+    bool k_up = dir == 1;
+    bool k_down = dir == 2;
+    bool k_left = dir == 3;
+    bool k_right = dir == 4;
+    bool cancel_pulse = false;
+
+    // Noch nichts markiert (bisher nur mit der Maus gearbeitet): der erste
+    // Tastendruck setzt den Cursor auf die gewaehlte Kategorie, sonst nichts.
+    if (g.NavId == 0 && dir_edge) {
+        m.jump_to_nav = true;
+        k_up = false;
+        k_down = false;
+        k_left = false;
+        k_right = false;
+    }
+
+    // Links/rechts auf einem Tree NICHT an ImGui geben -- ImGui klappt Trees damit
+    // auf/zu, bei uns tut das nur die Leertaste. Links springt zur Kategorie.
+    if ((nav_flags & ImGuiItemStatusFlags_Openable) != 0 && !slider_held) {
+        if (k_left && dir_edge) {
+            m.jump_to_nav = true;
+        }
+
+        k_left = false;
+        k_right = false;
+    }
+
+    // [SPALTENWECHSEL] Aus der Kategorien-Spalte nach rechts: gemerkter bzw. erster
+    // bedienbarer Eintrag im rechten Bereich (eingeloest in on_imgui_item_info).
+    if (nav_in_column && k_right) {
+        m.jump_to_detail = true;
+        k_right = false;
+    }
+
+    // Links gedrueckt und nach 3 Frames steht der Cursor noch am selben Eintrag:
+    // ImGui hat links nichts gefunden -> zur Kategorie springen.
+    if (m.left_probe_frames > 0 && --m.left_probe_frames == 0) {
+        if (!nav_in_column && g.NavId == m.left_probe_id) {
+            m.jump_to_nav = true;
+        }
+    }
+
+    if (!nav_in_column && k_left && !slider_held && dir_edge) {
+        m.left_probe_id = g.NavId;
+        m.left_probe_frames = 3;
+    }
+
+    // Backspace: zurueck.
+    const bool back_edge = key_back && !m.key_back_prev;
+    m.key_back_prev = key_back;
+
+    if (back_edge) {
+        if (g.ActiveId != 0 || ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopup)) {
+            cancel_pulse = true;
+        } else if (nav_in_column) {
+            m_desk_menu_close = true;
+        } else {
+            m.jump_to_nav = true;
+        }
+    }
+
+    // [SLIDER FESTHALTEN] Aktiver Slider: nur links/rechts zum Verstellen,
+    // hoch/runter gehen NICHT an ImGui. Backspace bleibt der einzige Ausweg.
+    if (slider_held) {
+        k_up = false;
+        k_down = false;
+        k_left = dir == 3;
+        k_right = dir == 4;
+        m.jump_to_detail = false;
+    }
+
+    // [KATEGORIE-RAND] Links am Rand nicht weiterlaufen lassen.
+    if (nav_in_column) {
+        if (k_up && g.NavId == m.nav_first_id) {
+            k_up = false;
+        }
+
+        if (k_down && g.NavId == m.nav_last_id) {
+            k_down = false;
+        }
+    }
+
+    const bool select_down = key_select && !slider_held;
+    m.key_select_prev = select_down;
+
+    io.AddKeyEvent(ImGuiKey_UpArrow, k_up);
+    io.AddKeyEvent(ImGuiKey_DownArrow, k_down);
+    io.AddKeyEvent(ImGuiKey_LeftArrow, k_left);
+    io.AddKeyEvent(ImGuiKey_RightArrow, k_right);
+    io.AddKeyEvent(ImGuiKey_Space, select_down);
+
+    // Escape nur als Impuls: EINEN Frame gedrueckt, im naechsten wieder los. Die
+    // echte Escape-Taste geht unveraendert an ImGui.
+    if (cancel_pulse) {
+        io.AddKeyEvent(ImGuiKey_Escape, true);
+    } else if (m.cancel_pulse_prev) {
+        io.AddKeyEvent(ImGuiKey_Escape, false);
+    }
+
+    m.cancel_pulse_prev = cancel_pulse;
+}
+
+// ============================================================================
+// [MENUE-KATEGORIEN 11.09.2026] Die linke Spalte.
+//
+// [ONI_MENU 26.09.2026] Onimusha:
+//   Logo                 ONIMUSHA Way of the Sword (Bild, mittig, skaliert)
+//   Mod Options          vorerst leer
+//   Developer            Menu Editor (Regler des Menues + Style Editor)
+//   REFramework Options  GANZ UNTEN, grau -- About + alle REFramework-Trees
+// ============================================================================
+void REFramework::draw_menu_nav() {
+    // [TASTATUR-NAVIGATION 16.09.2026] Steuerungs-Zustand des Kontexts, der
+    // gerade zeichnet: VR-Menue (Controller) oder Desktop (Tastatur); sonst nullptr.
+    auto* const nav = active_menu_nav();
+
+    const auto& style = ImGui::GetStyle();
+
+    // [VR-SCHRIFT 11.09.2026] Kategorien in der Kategorien-Schrift, ganz weiss und
+    // linksbuendig (bis 11.09. mittig mit rotem Anfangsbuchstaben). Im VR-Kontext
+    // die hochaufgeloeste Fassung, skaliert nach
+    // "Category Text Size"; am Desktop die normale Ueberschrift-Schrift.
+    // "REFramework Options" bleibt grau in der Grundschrift.
+    // [VOLLBILD 11.09.2026] Gilt jetzt fuer Desktop UND VR (m_menu_draw_scale).
+    const bool scaled = m_menu_draw_scale > 0.0f;
+    const float nav_mult = scaled ? (m_vr_menu_nav_text_scale * m_menu_draw_scale) : 1.0f;
+    const float window_scale = scaled ? (nav_mult / (float)VR_FONT_OVERSAMPLE) : 1.0f;
+
+    // [KATEGORIE-SCHRIFT 11.09.2026] re4-title (Resi-Schrift), ganz weiss.
+    ImFont* const cat_font = scaled ? m_vr_font_nav : (m_heading_font != nullptr ? m_heading_font : ImGui::GetDefaultFont());
+    ImFont* const ref_font = scaled ? m_vr_font_base : ImGui::GetDefaultFont();
+
+    const float cat_px = cat_font->LegacySize * window_scale;
+    const float ref_px = ref_font->LegacySize * window_scale;
+
+    // Breite nach dem breitesten Eintrag in SEINER Schrift -- die Spalte waechst
+    // also mit dem Regler und schiebt die Trennung nach rechts.
+    float text_width = ref_font->CalcTextSizeA(ref_px, FLT_MAX, 0.0f, "REFRAMEWORK OPTIONS").x;
+
+    // [GROSSBUCHSTABEN 11.09.2026] Beschriftungen links alle in Grossbuchstaben --
+    // hier und bei den item()-Aufrufen unten identisch halten.
+    for (const char* label : {"MOD OPTIONS", "DEVELOPER"}) {   // [ONI_MENU]
+        text_width = std::max(text_width, cat_font->CalcTextSizeA(cat_px, FLT_MAX, 0.0f, label).x);
+    }
+
+    const auto nav_width = text_width + (style.FramePadding.x * 4.0f * nav_mult);
+
+    // [RUNDLAUF 11.09.2026] BEWUSST ohne ImGuiChildFlags_NavFlattened: damit bleibt
+    // ImGuis Richtungsnavigation in ihrer Spalte. Mit dem Flag fand "hoch" am obersten
+    // Eintrag rechts die Kategorien links oben als Ziel -- der Rundlauf griff nie. Den
+    // Wechsel zwischen den Spalten machen wir selbst (run_vr_menu_frame).
+    ImGui::BeginChild("##re4vr_menu_nav", ImVec2(nav_width, 0.0f), ImGuiChildFlags_Borders,
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+
+    // [MENUE-STEUERUNG 11.09.2026] Fuer "zurueck": liegt der Cursor in dieser Spalte?
+    if (nav != nullptr) {
+        nav->nav_window = ImGui::GetCurrentWindow();
+    }
+
+    // Kategorien-Schrift fuer die ganze Spalte; die Fensterskalierung gilt nur hier.
+    ImGui::PushFont(cat_font, cat_font->LegacySize);
+    ImGui::SetWindowFontScale(window_scale);
+
+    // Zeilenhoehe wie ein Knopf, in der Kategorien-Schrift.
+    const auto row_height = ImGui::GetFrameHeight();
+
+    // [LINKSBUENDIG 11.09.2026] Die Beschriftungen zeichnet item() selbst,
+    // linksbuendig; 10 px (mitskaliert) zwischen den Eintraegen.
+    ImGui::PushStyleVar(ImGuiStyleVar_SelectableTextAlign, ImVec2(0.0f, 0.5f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(style.ItemSpacing.x, 10.0f * nav_mult));
+
+    const auto item = [&](const char* label, MenuCategory category, bool dimmed) {
+        const bool selected = m_menu_category == category;
+
+        // [ROTER STRICH 11.09.2026] Die Markierung malt item() selbst (s. unten),
+        // Selectable macht nur noch den Klick.
+        const auto min = ImGui::GetCursorScreenPos();
+        const auto max = ImVec2{min.x + ImGui::GetContentRegionAvail().x, min.y + row_height};
+
+        // Vor dem Selectable abgefragt, weil die Flaeche UNTER dem Text liegen muss.
+        const bool hovered = ImGui::IsWindowHovered() && ImGui::IsMouseHoveringRect(min, max);
+        const bool held = hovered && ImGui::IsMouseDown(ImGuiMouseButton_Left);
+
+        // [ROTER STRICH 11.09.2026] Statt der abgerundeten Flaeche ein Strich am
+        // unteren Rand der Zeile: in der Mitte dunkelrot (SliderGrab aus dem Theme),
+        // nach links UND rechts ausgeblendet. Voll bei der gewaehlten Kategorie,
+        // schwaecher bei Klick und Hover. 3 px, mitskaliert.
+        float line_alpha = 0.0f;
+
+        // [HELLER 16.09.2026 -- Ansage des Users] Hover war zu dunkel: er bekommt
+        // jetzt die volle Staerke, die vorher die Auswahl hatte. Die Auswahl
+        // selbst ist heller -- gleiche volle Deckkraft, aber ein helleres Rot
+        // (SELECTED_RED) statt SliderGrab.
+        if (selected) {
+            line_alpha = 1.0f;
+        } else if (held) {
+            line_alpha = 0.6f;
+        } else if (hovered) {
+            line_alpha = 1.0f;
+        }
+
+        if (line_alpha > 0.0f) {
+            const float thickness = 3.0f * nav_mult;
+            const float mid_x = (min.x + max.x) * 0.5f;
+            const ImVec4 SELECTED_RED = menu_accent(0.85f);   // [ONI_MENU] Akzent (RE9: blau, RE4: rot)
+            const ImVec4 red = selected ? SELECTED_RED : ImGui::GetStyleColorVec4(ImGuiCol_SliderGrab);
+            const ImU32 center = ImGui::GetColorU32(ImVec4{red.x, red.y, red.z, red.w * line_alpha});
+            const ImU32 faded = ImGui::GetColorU32(ImVec4{red.x, red.y, red.z, 0.0f});
+            auto* const draw_list = ImGui::GetWindowDrawList();
+
+            // Zwei Haelften, Ecken jeweils: oben links, oben rechts, unten rechts, unten links.
+            draw_list->AddRectFilledMultiColor(ImVec2{min.x, max.y - thickness}, ImVec2{mid_x, max.y},
+                                               faded, center, center, faded);
+            draw_list->AddRectFilledMultiColor(ImVec2{mid_x, max.y - thickness}, max,
+                                               center, faded, faded, center);
+        }
+
+        // Selectables eigene (eckige) Flaechen durchsichtig.
+        ImGui::PushStyleColor(ImGuiCol_Header, IM_COL32(0, 0, 0, 0));
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, IM_COL32(0, 0, 0, 0));
+        ImGui::PushStyleColor(ImGuiCol_HeaderActive, IM_COL32(0, 0, 0, 0));
+
+        // [GEDIMMT 10.09.2026] Dasselbe Grau wie frueher am Header
+        // "REFramework Options": das gehoert nicht zum Mod, das ist das
+        // Bastel-Zubehoer von REFramework. Grundschrift statt RE4-Schrift.
+        if (dimmed) {
+            ImGui::PushFont(ref_font, ref_font->LegacySize);
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{0.55f, 0.55f, 0.55f, 1.0f});
+        }
+
+        // Alle Eintraege zeichnen ihre Beschriftung selbst (s. unten), das
+        // Selectable bekommt nur eine unsichtbare ID.
+        const std::string selectable_id = std::string{"##nav_"} + label;
+
+        if (ImGui::Selectable(selectable_id.c_str(), selected, ImGuiSelectableFlags_None, ImVec2(0.0f, row_height))) {
+            // [MENUE-SOUNDS 11.09.2026] Nur bei echtem Wechsel, nicht beim
+            // erneuten Klick auf die schon gewaehlte Kategorie.
+            if (m_menu_category != category) {
+                queue_menu_sound(MenuSound::Category);
+            }
+
+            m_menu_category = category;
+        }
+
+        // [KATEGORIE-RAND 11.09.2026] IDs des obersten und untersten Eintrags merken.
+        if (nav != nullptr) {
+            if (category == (ONI_DEV_UI ? MenuCategory::ModOptions : MenuCategory::Bindings)) {   // [ONI_DEV_UI] oberster Eintrag
+                nav->nav_first_id = ImGui::GetItemID();
+            } else if (category == MenuCategory::RefOptions) {
+                nav->nav_last_id = ImGui::GetItemID();
+            }
+        }
+
+        // [LINKSBUENDIG 11.09.2026] Beschriftung linksbuendig, senkrecht mittig, ganz
+        // in der Textfarbe: weiss, "REFramework Options" grau (oben gepusht). Vorher
+        // mittig mit knallrotem ersten Buchstaben. Einzug FramePadding.x * 2
+        // (mitskaliert) -- aber nie mehr, als der breiteste Eintrag (text_width)
+        // Platz laesst, sonst wuerde er rechts abgeschnitten. Fuer alle Eintraege
+        // derselbe Einzug, damit sie buendig stehen.
+        {
+            auto* const font = ImGui::GetFont();
+            const float font_px = ImGui::GetFontSize();
+            const auto text_size = font->CalcTextSizeA(font_px, FLT_MAX, 0.0f, label);
+            const float inset = std::min(style.FramePadding.x * 2.0f * nav_mult,
+                                         std::max(0.0f, ((max.x - min.x) - text_width) * 0.5f));
+            const ImVec2 text_pos{min.x + inset, min.y + (row_height - text_size.y) * 0.5f};
+
+            // [ERSTER BUCHSTABE ROT 16.09.2026 -- Ansage des Users] Nur bei der
+            // GEWAEHLTEN Kategorie der erste Buchstabe knallrot, wie bei
+            // draw_menu_heading; der Rest bleibt in der Textfarbe. Die Labels sind
+            // reines ASCII, ein Byte = ein Buchstabe.
+            if (selected && label[0] != '\0') {
+                auto* const draw_list = ImGui::GetWindowDrawList();
+                const float first_w = font->CalcTextSizeA(font_px, FLT_MAX, 0.0f, label, label + 1).x;
+
+                draw_list->AddText(font, font_px, text_pos, ImGui::GetColorU32(menu_accent()), label, label + 1);   // [ONI_MENU] Akzent
+                draw_list->AddText(font, font_px, ImVec2{text_pos.x + first_w, text_pos.y},
+                                   ImGui::GetColorU32(ImGuiCol_Text), label + 1);
+            } else {
+                ImGui::GetWindowDrawList()->AddText(font, font_px, text_pos, ImGui::GetColorU32(ImGuiCol_Text), label);
+            }
+        }
+
+        // [MENUE-STEUERUNG 11.09.2026] Controller-Cursor auf die gewaehlte
+        // Kategorie setzen (beim Oeffnen und bei "zurueck") -- nur im VR-Kontext.
+        if (selected && nav != nullptr && nav->jump_to_nav) {
+            ImGui::SetFocusID(ImGui::GetItemID(), ImGui::GetCurrentWindow());
+            ImGui::SetNavCursorVisible(true);
+            nav->jump_to_nav = false;
+        }
+
+        ImGui::PopStyleColor(3 + (dimmed ? 1 : 0));
+
+        if (dimmed) {
+            ImGui::PopFont();
+        }
+    };
+
+    // [ONI_MENU 26.09.2026 -- Ansage des Users] Oben das Logo "ONIMUSHA Way of the
+    // Sword" (eingebettetes PNG, img_oni_logo.hpp, Textur in create_menu_images_d3d12).
+    // Immer waagerecht mittig in der Spalte, Breite = Innenbreite der Spalte x
+    // "Logo Scale", Hoehe nach Seitenverhaeltnis. Abstand zum oberen Rand = "Logo
+    // Top Gap" (px bei Massstab 1). Beides waechst mit der Spalte (nav_mult: Category
+    // Text Size x Menue-Massstab), Desktop wie VR. Einstellbar unter DEVELOPER ->
+    // Menu Editor. Reines Bild, kein Selectable: die Controller-Navigation springt nie
+    // darauf, nav_first_id bleibt MOD OPTIONS.
+    // Ohne Textur (D3D11 oder Laden gescheitert) bleibt nur der Abstand.
+    {
+        ImGui::Dummy(ImVec2{0.0f, m_vr_menu_logo_top_gap * nav_mult});
+
+        const float avail = ImGui::GetContentRegionAvail().x;
+        const float logo_w = avail * m_vr_menu_logo_scale;
+        const auto logo_tex = get_menu_logo_texture();
+
+        if (logo_tex.has_value() && logo_w > 1.0f) {
+            const float logo_h = logo_w * logo_tex->second;
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail - logo_w) * 0.5f);
+            ImGui::Image(ImTextureRef{logo_tex->first}, ImVec2{logo_w, logo_h});
+        }
+
+        ImGui::Dummy(ImVec2{0.0f, row_height});
+    }
+
+    // [ONI_MENU 26.09.2026] Kategorien: MOD OPTIONS (vorerst leer), DEVELOPER und
+    // ganz unten REFRAMEWORK OPTIONS (grau, Grundschrift).
+    if constexpr (ONI_DEV_UI) {   // [ONI_DEV_UI] Public ohne MOD OPTIONS (noch leer)
+        item("MOD OPTIONS", MenuCategory::ModOptions, false);
+    }
+    item("BINDINGS", MenuCategory::Bindings, false);     // [ONI_BIND]
+    item("RENDERING", MenuCategory::Rendering, false);   // [ONI_RENDER]
+    if constexpr (ONI_DEV_UI) {   // [ONI_DEV_UI] Public ohne DEVELOPER
+        item("DEVELOPER", MenuCategory::Developer, false);
+    }
+
+    // "REFramework Options" ganz unten: der Abstand fuellt, was die Spalte
+    // uebrig hat. Reicht die Hoehe nicht, steht der Eintrag direkt darunter.
+    const auto spare = ImGui::GetContentRegionAvail().y - row_height - style.ItemSpacing.y;
+
+    if (spare > 0.0f) {
+        ImGui::Dummy(ImVec2(0.0f, spare));
+    }
+
+    item("REFRAMEWORK OPTIONS", MenuCategory::RefOptions, true);
+
+    ImGui::PopStyleVar(2);
+    ImGui::PopFont();
+    ImGui::EndChild();
+}
+
+// Die rechte Spalte: der Inhalt der gewaehlten Kategorie.
+void REFramework::draw_menu_detail() {
+    // [TASTATUR-NAVIGATION 16.09.2026] Steuerungs-Zustand des Kontexts, der
+    // gerade zeichnet: VR-Menue (Controller) oder Desktop (Tastatur); sonst nullptr.
+    auto* const nav = active_menu_nav();
+
+    // [RUNDLAUF 11.09.2026] Ohne NavFlattened, s. draw_menu_nav.
+    ImGui::BeginChild("##re4vr_menu_detail", ImVec2(0.0f, 0.0f), ImGuiChildFlags_None);
+
+    // [MENUE-STEUERUNG 11.09.2026] Rechter Stick hoch/runter = scrollen.
+    if (nav != nullptr && nav->scroll_delta != 0.0f) {
+        ImGui::SetScrollY(ImGui::GetScrollY() - nav->scroll_delta);
+        nav->scroll_delta = 0.0f;
+    }
+
+    // [SPALTENWECHSEL 11.09.2026] Wechsel von links nach rechts beginnt ganz oben --
+    // [SPALTENWECHSEL MERKEN 11.09.2026] ausser es gibt fuer diese Kategorie einen
+    // gemerkten Eintrag: dann zurueck auf dessen Scroll-Position.
+    const bool jump_this_frame = nav != nullptr && nav->jump_to_detail;
+
+    if (jump_this_frame) {
+        const auto cat = (size_t)m_menu_category;
+        const bool has_memory = cat < MENU_CATEGORY_COUNT && nav->detail_last_id[cat] != 0;
+
+        ImGui::SetScrollY(has_memory ? nav->detail_last_scroll[cat] : 0.0f);
+        nav->detail_fallback_id = 0;
+        nav->detail_fallback_window = nullptr;
+    }
+
+    // [VR-SCHRIFT 11.09.2026] Im VR-Kontext wird der ganze rechte Bereich nach
+    // "Content Text Size" skaliert: hochaufgeloeste Schrift + Fensterskalierung,
+    // dazu Innenraender, Abstaende, Rundungen und die festen menu_px-Werte im
+    // selben Faktor -- alles waechst gemeinsam, das Verhaeltnis bleibt.
+    // [VOLLBILD 11.09.2026] Gilt jetzt fuer Desktop UND VR (m_menu_draw_scale).
+    const bool vr_detail = m_menu_draw_scale > 0.0f;
+
+    if (vr_detail) {
+        const float s = m_vr_menu_detail_text_scale * m_menu_draw_scale;
+        const auto& st = ImGui::GetStyle();
+
+        ImGui::PushFont(m_vr_font_base, m_vr_font_base->LegacySize);
+        ImGui::SetWindowFontScale(s / (float)VR_FONT_OVERSAMPLE);
+
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2{st.FramePadding.x * s, st.FramePadding.y * s});
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2{st.ItemSpacing.x * s, st.ItemSpacing.y * s});
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemInnerSpacing, ImVec2{st.ItemInnerSpacing.x * s, st.ItemInnerSpacing.y * s});
+        ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2{st.CellPadding.x * s, st.CellPadding.y * s});
+        ImGui::PushStyleVar(ImGuiStyleVar_IndentSpacing, st.IndentSpacing * s);
+        ImGui::PushStyleVar(ImGuiStyleVar_GrabMinSize, st.GrabMinSize * s);
+        ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, st.ScrollbarSize * s);
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, st.FrameRounding * s);
+        ImGui::PushStyleVar(ImGuiStyleVar_GrabRounding, st.GrabRounding * s);
+
+        m_menu_px_scale = s;
+    }
+
+    // [MENUE-SOUNDS 11.09.2026] Nur hier drin melden die Widgets sich ueber
+    // ImGuiTestEngineHook_ItemInfo (Sounds); unten vor EndChild wieder aus.
+    ImGui::GetCurrentContext()->TestEngineHookItems = true;
+
+    // [ABSTAND OBEN 11.09.2026] Eine halbe Zeile Luft ueber dem ersten Eintrag
+    // ("Status", "Upscaling" ...) -- dieselbe wie der Absatz unter den
+    // Ueberschriften. Gilt fuer JEDE Kategorie; scrollt mit dem Inhalt.
+    ImGui::Dummy(ImVec2(0.0f, ImGui::GetTextLineHeight() * 0.5f));
+
+    // [ONI_MENU 26.09.2026] Nur drei Kategorien: MOD OPTIONS (vorerst leer),
+    // DEVELOPER (Menu Editor) und REFRAMEWORK OPTIONS.
+    if (m_error.empty() && m_game_data_initialized && m_mods != nullptr) {
+        switch (m_menu_category) {
+        case MenuCategory::ModOptions:
+            // [ONI_MENU] Vorerst leer.
+            break;
+        case MenuCategory::Bindings:
+            draw_bindings_image();   // [ONI_BIND]
+            break;
+        case MenuCategory::Rendering: {
+            // [ONI_RENDER] Kopie des REFramework-Schalters "Use AFR" (VR-Tree) im Menue-Stil;
+            // derselbe Config-Wert VR_AlternateFrameRendering.
+            if (auto& vr = VR::get(); vr != nullptr) {
+                draw_menu_checkbox("Alternate Frame Rendering (AFR)", &vr->afr_value());
+            }
+            break;
+        }
+        case MenuCategory::Developer:
+            if constexpr (ONI_DEV_UI) {
+                draw_menu_editor();
+            }
+            break;
+        case MenuCategory::RefOptions:
+            draw_ref_options();
+            break;
+        default:
+            break;
+        }
+    } else if (!m_game_data_initialized) {
+        ImGui::TextWrapped("REFramework is currently initializing...");
+        ImGui::TextWrapped("This menu will close after initialization if you have the remember option enabled.");
+    } else if (!m_error.empty()) {
+        ImGui::TextWrapped("REFramework error: %s", m_error.c_str());
+    }
+
+    // [ABSTAND UNTEN 11.09.2026] Eine Zeile Luft unter dem letzten Eintrag --
+    // gilt fuer JEDE Kategorie. Der Dummy verlaengert den Scrollbereich, der
+    // letzte Eintrag klebt also auch ganz nach unten gescrollt nicht mehr am
+    // Fensterrand.
+    ImGui::Dummy(ImVec2(0.0f, ImGui::GetTextLineHeight()));
+
+    // [RUNDLAUF 11.09.2026] Am obersten Eintrag "hoch" -> letzter Eintrag, am
+    // untersten "runter" -> erster. ImGui prueft selbst, ob der Cursor in DIESEM
+    // Fenster steht und gerade eine Hoch/Runter-Anfrage ohne Treffer laeuft.
+    if (nav != nullptr) {
+        ImGui::NavMoveRequestTryWrapping(ImGui::GetCurrentWindow(), ImGuiNavMoveFlags_LoopY);
+    }
+
+    // [SPALTENWECHSEL 11.09.2026] Nichts Bedienbares rechts (z. B. nur das
+    // Bindings-Bild): der Wunsch verfaellt, statt spaeter irgendwo zu landen.
+    if (nav != nullptr) {
+        // [SPALTENWECHSEL MERKEN 11.09.2026] Gemerkter Eintrag kam in diesem Frame
+        // nicht vor (z. B. Tree zugeklappt): erster bedienbarer Eintrag, ganz oben.
+        if (nav->jump_to_detail && nav->detail_fallback_id != 0) {
+            ImGui::SetFocusID(nav->detail_fallback_id, static_cast<ImGuiWindow*>(nav->detail_fallback_window));
+            ImGui::SetNavCursorVisible(true);
+            ImGui::SetScrollY(0.0f);
+        }
+
+        nav->jump_to_detail = false;
+        nav->detail_fallback_id = 0;
+        nav->detail_fallback_window = nullptr;
+
+        // Merken, wo der Cursor rechts steht -- nicht im Sprung-Frame selbst: dort
+        // steht der Scroll noch auf dem alten Wert (SetScrollY greift erst im
+        // naechsten Frame), das wuerde den gemerkten Wert ueberschreiben. Popups
+        // (Combo-Listen) zaehlen nicht.
+        const auto& ng = *ImGui::GetCurrentContext();
+        const auto cat = (size_t)m_menu_category;
+
+        if (!jump_this_frame && cat < MENU_CATEGORY_COUNT && ng.NavWindow != nullptr && ng.NavId != 0
+            && ng.NavWindow != static_cast<ImGuiWindow*>(nav->nav_window)
+            && (ng.NavWindow->Flags & ImGuiWindowFlags_Popup) == 0) {
+            nav->detail_last_id[cat] = ng.NavId;
+            nav->detail_last_scroll[cat] = ImGui::GetScrollY();
+        }
+    }
+
+    if (vr_detail) {
+        ImGui::PopStyleVar(9);
+        ImGui::PopFont();
+        m_menu_px_scale = 1.0f;
+    }
+
+    ImGui::GetCurrentContext()->TestEngineHookItems = false;   // [MENUE-SOUNDS]
+
+    ImGui::EndChild();
+}
+
+// [GENERAL RAUS 11.09.2026] Die Kategorie "General" (Recenter View + Font
+// Size) ist samt Inhalt entfallen. Die Font Size kommt weiter aus der Config,
+// der Recenter-Hotkey (VR.cpp, m_recenter_view_key) arbeitet unveraendert.
+
+// [REFRAMEWORK OPTIONS 10.09.2026] Alle REFramework-eigenen Trees, frueher im
+// Sammelbaum ganz unten im Public-UI, jetzt als eigene Kategorie -- auch im
+// Public-Release. "About" gehoert dazu, es ist ebenfalls REFramework-eigen.
+//
+// Der Style Editor liegt bewusst NICHT hier, sondern im Menu Editor unter
+// DEVELOPER ([ONI_MENU]; RE9: RE9VRMenu::draw_dev).
+void REFramework::draw_ref_options() {
+    draw_about();
+    m_mods->draw_ref_trees();
+}
+
+// ============================================================================
+// [ONI_MENU 26.09.2026] Menu Editor (Kategorie DEVELOPER) -- Port des Trees
+// "RE9VR - Menu Editor" (RE9VRMenu::draw_menu_editor) ohne RE9-Mod. Statt
+// "Logo Title/Subtitle Size" gibt es "Logo Scale" und "Logo Top Gap". Gespeichert
+// wird beim Loslassen eines Reglers (kein Knopf), in
+// reframework/data/oni_vr/oni_vr_menu.txt (key=value). Fehlt die Datei, bleiben
+// die Defaults aus REFramework.hpp.
+// ============================================================================
+std::filesystem::path REFramework::menu_editor_cfg_path() {
+    return get_persistent_dir() / "reframework" / "data" / "oni_vr" / "oni_vr_menu.txt";
+}
+
+void REFramework::load_menu_editor_cfg() {
+    m_menu_editor_cfg_loaded = true;
+
+    try {
+        const auto path = menu_editor_cfg_path();
+
+        if (!fs::exists(path)) {
+            return;
+        }
+
+        const utility::Config cfg{path.string()};
+
+        const auto num = [&](const char* k, auto setter) {
+            if (const auto v = cfg.get<float>(k); v.has_value()) {
+                setter(*v);
+            }
+        };
+
+        num("vr_panel_width", [this](float v) { set_vr_menu_panel_width(v); });
+        num("vr_panel_distance", [this](float v) { set_vr_menu_panel_distance(v); });
+        num("vr_category_text_scale", [this](float v) { set_vr_menu_nav_text_scale(v); });
+        num("vr_content_text_scale", [this](float v) { set_vr_menu_detail_text_scale(v); });
+        num("vr_stick_deadzone", [this](float v) { set_vr_menu_stick_deadzone(v); });
+        num("vr_category_rounding", [this](float v) { set_vr_menu_nav_rounding(v); });
+        num("vr_stick_repeat_delay", [this](float v) { set_vr_menu_repeat_delay(v); });
+        num("vr_stick_repeat_interval", [this](float v) { set_vr_menu_repeat_interval(v); });
+        num("vr_scroll_speed", [this](float v) { set_vr_menu_scroll_speed(v); });
+        num("vr_logo_scale", [this](float v) { set_vr_menu_logo_scale(v); });
+        num("vr_logo_top_gap", [this](float v) { set_vr_menu_logo_top_gap(v); });
+    } catch (...) {
+        // Kaputte Datei: Defaults bleiben.
+    }
+}
+
+void REFramework::save_menu_editor_cfg() {
+    try {
+        const auto path = menu_editor_cfg_path();
+        std::error_code ec{};
+        fs::create_directories(path.parent_path(), ec);
+
+        utility::Config cfg{};
+        cfg.set<float>("vr_panel_width", get_vr_menu_panel_width());
+        cfg.set<float>("vr_panel_distance", get_vr_menu_panel_distance());
+        cfg.set<float>("vr_category_text_scale", get_vr_menu_nav_text_scale());
+        cfg.set<float>("vr_content_text_scale", get_vr_menu_detail_text_scale());
+        cfg.set<float>("vr_stick_deadzone", get_vr_menu_stick_deadzone());
+        cfg.set<float>("vr_category_rounding", get_vr_menu_nav_rounding());
+        cfg.set<float>("vr_stick_repeat_delay", get_vr_menu_repeat_delay());
+        cfg.set<float>("vr_stick_repeat_interval", get_vr_menu_repeat_interval());
+        cfg.set<float>("vr_scroll_speed", get_vr_menu_scroll_speed());
+        cfg.set<float>("vr_logo_scale", get_vr_menu_logo_scale());
+        cfg.set<float>("vr_logo_top_gap", get_vr_menu_logo_top_gap());
+        cfg.save(path.string());
+    } catch (...) {
+    }
+}
+
+void REFramework::draw_menu_editor() {
+    // [STYLE EDITOR] ImGuis Live-Editor. Aenderungen sind FLUECHTIG -- behalten
+    // heisst: Tab "Colors" -> "Only Modified Colors" aus -> "Export" -> der Block
+    // gehoert in REFramework::set_imgui_style().
+    if (!ImGui::TreeNode("Menu Editor")) {
+        return;
+    }
+
+    const auto slider = [this](const char* label, float value, float lo, float hi, const char* fmt, auto setter) {
+        if (ImGui::SliderFloat(label, &value, lo, hi, fmt)) {
+            setter(value);
+        }
+
+        // Gespeichert wird erst beim Loslassen.
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            save_menu_editor_cfg();
+        }
+    };
+
+    slider("Category Text Size", get_vr_menu_nav_text_scale(), 0.5f, 5.0f, "%.2f",
+           [this](float v) { set_vr_menu_nav_text_scale(v); });
+    slider("Logo Scale", get_vr_menu_logo_scale(), 0.1f, 2.0f, "%.2f",
+           [this](float v) { set_vr_menu_logo_scale(v); });
+    slider("Logo Top Gap", get_vr_menu_logo_top_gap(), 0.0f, 200.0f, "%.0f",
+           [this](float v) { set_vr_menu_logo_top_gap(v); });
+    slider("Category Rounding", get_vr_menu_nav_rounding(), 0.0f, 40.0f, "%.1f",
+           [this](float v) { set_vr_menu_nav_rounding(v); });
+    slider("Content Text Size", get_vr_menu_detail_text_scale(), 0.5f, 3.0f, "%.2f",
+           [this](float v) { set_vr_menu_detail_text_scale(v); });
+    slider("Stick Deadzone", get_vr_menu_stick_deadzone(), 0.2f, 0.95f, "%.2f",
+           [this](float v) { set_vr_menu_stick_deadzone(v); });
+    slider("Stick Repeat Delay (s)", get_vr_menu_repeat_delay(), 0.1f, 1.0f, "%.2f",
+           [this](float v) { set_vr_menu_repeat_delay(v); });
+    slider("Scroll Speed (px/s)", get_vr_menu_scroll_speed(), 200.0f, 4000.0f, "%.0f",
+           [this](float v) { set_vr_menu_scroll_speed(v); });
+    slider("Stick Repeat Interval (s)", get_vr_menu_repeat_interval(), 0.03f, 0.6f, "%.2f",
+           [this](float v) { set_vr_menu_repeat_interval(v); });
+    slider("VR Menu Width (m)", get_vr_menu_panel_width(), 0.5f, 4.0f, "%.2f",
+           [this](float v) { set_vr_menu_panel_width(v); });
+    slider("VR Menu Distance (m)", get_vr_menu_panel_distance(), 0.5f, 3.0f, "%.2f",
+           [this](float v) { set_vr_menu_panel_distance(v); });
+
+    ImGui::Separator();
+    ImGui::ShowStyleEditor();
+
+    ImGui::TreePop();
+}
+
+// ============================================================================
+// [ONI_MENU 26.09.2026] Logo oben in der Kategorien-Spalte (Vorbild: RE4-Fork,
+// load_embedded_image_d3d12). Das eingebettete PNG (img_oni_logo.hpp) wird per
+// DirectXTK12/WIC in eine Textur geladen, ihre SRV liegt im Slot
+// D3D12::SRV::ONI_MENU_LOGO -- derselbe Heap, den beide ImGui-Renderer (Desktop
+// und VR) setzen. Nur D3D12; unter D3D11 fehlt das Logo.
+// ============================================================================
+void REFramework::create_menu_images_d3d12(ID3D12Device* device) {
+    m_d3d12.menu_logo.Reset();
+    m_d3d12.menu_bindings.Reset();
+
+    if (device == nullptr) {
+        return;
+    }
+
+    // WIC braucht COM auf diesem Thread. Bewusst KEIN CoUninitialize: DirectXTK
+    // merkt sich die WIC-Factory statisch. Ist der Thread schon STA, meldet das
+    // RPC_E_CHANGED_MODE -- WIC funktioniert dann trotzdem.
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+
+    // Erst MIT Mip-Kette (das Logo wird stark verkleinert gezeichnet, der ImGui-
+    // Sampler nutzt Mips), scheitert das, ohne.
+    for (const auto mips : {true, false}) {
+        DirectX::ResourceUploadBatch upload{device};
+        upload.Begin();
+
+        ComPtr<ID3D12Resource> texture{};
+
+        // IGNORE_SRGB: das Bild soll so aussehen wie am PC.
+        const auto flags = mips ? (DirectX::WIC_LOADER_IGNORE_SRGB | DirectX::WIC_LOADER_MIP_AUTOGEN)
+                                : DirectX::WIC_LOADER_IGNORE_SRGB;
+        const auto hr = DirectX::CreateWICTextureFromMemoryEx(device, upload, oni_logo_png, sizeof(oni_logo_png),
+            0, D3D12_RESOURCE_FLAG_NONE, flags, texture.GetAddressOf());
+
+        auto finished = upload.End(m_d3d12_hook->get_command_queue());
+        finished.wait();
+
+        if (FAILED(hr) || texture == nullptr) {
+            continue;
+        }
+
+        texture->SetName(L"Framework::m_d3d12.menu_logo");
+        device->CreateShaderResourceView(texture.Get(), nullptr, m_d3d12.get_cpu_srv(device, D3D12::SRV::ONI_MENU_LOGO));
+        m_d3d12.menu_logo = texture;
+        break;
+    }
+
+    // [ONI_BIND 27.09.2026] Bild der Kategorie BINDINGS (JPG, ohne Mips wie RE4)
+    {
+        DirectX::ResourceUploadBatch upload{device};
+        upload.Begin();
+
+        ComPtr<ID3D12Resource> texture{};
+        const auto hr = DirectX::CreateWICTextureFromMemoryEx(device, upload, oni_bindings_jpg, sizeof(oni_bindings_jpg),
+            0, D3D12_RESOURCE_FLAG_NONE, DirectX::WIC_LOADER_IGNORE_SRGB, texture.GetAddressOf());
+
+        auto finished = upload.End(m_d3d12_hook->get_command_queue());
+        finished.wait();
+
+        if (SUCCEEDED(hr) && texture != nullptr) {
+            texture->SetName(L"Framework::m_d3d12.menu_bindings");
+            device->CreateShaderResourceView(texture.Get(), nullptr, m_d3d12.get_cpu_srv(device, D3D12::SRV::ONI_MENU_BINDINGS));
+            m_d3d12.menu_bindings = texture;
+        }
+    }
+}
+
+// [ONI_BIND 27.09.2026] Bild fuellt die rechte Spalte so gross wie Breite UND Hoehe es
+// erlauben, ohne Scrollen, waagerecht mittig (wie RE4 draw_bindings_image, ohne Vergroesserung).
+void REFramework::draw_bindings_image() {
+    if (m_renderer_type != RendererType::D3D12 || m_d3d12.menu_bindings == nullptr || m_d3d12.srv_desc_heap == nullptr
+        || m_d3d12_hook == nullptr) {
+        ImGui::TextWrapped("Bindings image not available.");
+        return;
+    }
+
+    auto device = m_d3d12_hook->get_device();
+
+    if (device == nullptr) {
+        return;
+    }
+
+    const auto desc = m_d3d12.menu_bindings->GetDesc();
+    const auto avail = ImGui::GetContentRegionAvail();
+
+    if (avail.x < 1.0f || avail.y < 1.0f || desc.Width == 0 || desc.Height == 0) {
+        return;
+    }
+
+    const auto tex = (ImTextureID)m_d3d12.get_gpu_srv(device, D3D12::SRV::ONI_MENU_BINDINGS).ptr;
+    const float img_aspect = (float)desc.Width / (float)desc.Height;
+    const float max_h = std::max(1.0f, avail.y - ImGui::GetTextLineHeight() - ImGui::GetStyle().ItemSpacing.y * 2.0f);
+    float w = avail.x;
+    float h = w / img_aspect;
+
+    if (h > max_h) {
+        h = max_h;
+        w = h * img_aspect;
+    }
+
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail.x - w) * 0.5f);
+    ImGui::Image(tex, ImVec2{w, h});
+}
+
+std::optional<std::pair<ImTextureID, float>> REFramework::get_menu_logo_texture() {
+    if (m_renderer_type != RendererType::D3D12 || m_d3d12.menu_logo == nullptr || m_d3d12.srv_desc_heap == nullptr
+        || m_d3d12_hook == nullptr) {
+        return std::nullopt;
+    }
+
+    auto device = m_d3d12_hook->get_device();
+
+    if (device == nullptr) {
+        return std::nullopt;
+    }
+
+    const auto desc = m_d3d12.menu_logo->GetDesc();
+
+    if (desc.Width == 0 || desc.Height == 0) {
+        return std::nullopt;
+    }
+
+    return std::make_pair((ImTextureID)m_d3d12.get_gpu_srv(device, D3D12::SRV::ONI_MENU_LOGO).ptr,
+                          (float)desc.Height / (float)desc.Width);
+}
+
+void REFramework::draw_menu_heading(const char* text, bool gap_before) {
+    // DAVOR: Absatz, Trennstrich, Absatz -- dieselbe halbe Zeile wie der
+    // Absatz unter der Ueberschrift. [ROT 11.09.2026] Der Strich im Rot des
+    // Fensterrahmens (ImGuiCol_Border) -- zwischendurch war er weiss, der User
+    // wollte ihn wieder rot.
+    if (gap_before) {
+        const auto gap = ImVec2(0.0f, ImGui::GetTextLineHeight() * 0.5f);
+
+        ImGui::Dummy(gap);
+        ImGui::PushStyleColor(ImGuiCol_Separator, ImGui::GetStyleColorVec4(ImGuiCol_Border));
+        // [DICKER 11.09.2026] 2 px statt 1 -- ImGui::Separator() hat die Staerke
+        // fest auf 1, deshalb direkt SeparatorEx mit denselben Flags wie dort.
+        ImGui::SeparatorEx(ImGuiSeparatorFlags_Horizontal | ImGuiSeparatorFlags_SpanAllColumns, 2.0f);
+        ImGui::PopStyleColor();
+        ImGui::Dummy(gap);
+    }
+
+    // [VR-SCHRIFT 11.09.2026] Im VR-Kontext die hochaufgeloeste Fassung -- die
+    // Fensterskalierung des rechten Bereichs bringt sie dort auf Groesse.
+    ImFont* const heading_font = (m_menu_draw_scale > 0.0f && m_vr_font_heading != nullptr) ? m_vr_font_heading : m_heading_font;
+    const bool has_font = heading_font != nullptr;
+
+    if (has_font) {
+        ImGui::PushFont(heading_font, heading_font->LegacySize);
+    }
+
+    // [LINKSBUENDIG 11.09.2026] Stand vorher mittig ueber dem Bereich -- jetzt
+    // linksbuendig wie der Inhalt darunter.
+
+    // [ERSTER BUCHSTABE ROT 11.09.2026] Nur der erste Buchstabe knallrot, der
+    // Rest in der normalen Textfarbe (weiss). Zwei TextUnformatted direkt
+    // aneinander (SameLine ohne Abstand) -- ImGui kernt nicht, die Breite
+    // bleibt also exakt die des ganzen Textes.
+    // Die Ueberschriften sind reines ASCII, ein Byte = ein Buchstabe.
+    if (text[0] != '\0') {
+        ImGui::PushStyleColor(ImGuiCol_Text, menu_accent());   // [ONI_MENU] Akzent
+        ImGui::TextUnformatted(text, text + 1);
+        ImGui::PopStyleColor();
+
+        if (text[1] != '\0') {
+            ImGui::SameLine(0.0f, 0.0f);
+            ImGui::TextUnformatted(text + 1);
+        }
+    }
+
+    if (has_font) {
+        ImGui::PopFont();
+    }
+
+    // Absatz: eine halbe Zeile (normale Schrift) Abstand zum Inhalt darunter.
+    ImGui::Dummy(ImVec2(0.0f, ImGui::GetTextLineHeight() * 0.5f));
+}
+
+void REFramework::push_menu_toggle_style() {
+    // Weiss aus dem Theme-CheckMark -- als Kopie, weil der Haken gleich rot wird.
+    const ImVec4 border_color = ImGui::GetStyleColorVec4(ImGuiCol_CheckMark);
+
+    push_menu_toggle_style(border_color);
+}
+
+void REFramework::push_menu_toggle_style(const ImVec4& border_color) {
+    // Den Rahmen zeichnet Checkbox in ImGuiCol_Border (Theme: dunkelrot) mit
+    // FrameBorderSize und FrameRounding. [RAHMEN 11.09.2026] 1 px dicker als im
+    // Theme und 90-Grad-Ecken. [ROTER HAKEN 11.09.2026] Haken knallrot.
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, ImGui::GetStyle().FrameBorderSize + 1.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
+    ImGui::PushStyleColor(ImGuiCol_Border, border_color);
+    ImGui::PushStyleColor(ImGuiCol_CheckMark, MENU_CHECKMARK_COLOR);
+}
+
+void REFramework::pop_menu_toggle_style() {
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(2);
+}
+
+bool REFramework::draw_menu_checkbox(const char* label, bool* v) {
+    push_menu_toggle_style();
+    const bool pressed = ImGui::Checkbox(label, v);
+    pop_menu_toggle_style();
+
+    return pressed;
+}
+
+bool REFramework::draw_menu_radio(const char* label, bool active) {
+    const ImVec4 border_color = ImGui::GetStyleColorVec4(ImGuiCol_CheckMark);
+
+    return draw_menu_radio(label, active, border_color);
+}
+
+bool REFramework::draw_menu_radio(const char* label, bool active, const ImVec4& border_color) {
+    // [WIE TOGGLE 11.09.2026] Sieht aus wie ein Toggle, verhaelt sich aber wie eine
+    // Auswahl: der Haken folgt allein `active` -- ein Klick auf die gewaehlte Option
+    // nimmt ihn also nicht weg, die Kopie `shown` wird verworfen.
+    bool shown = active;
+
+    push_menu_toggle_style(border_color);
+    const bool pressed = ImGui::Checkbox(label, &shown);
+    pop_menu_toggle_style();
+
+    return pressed;
 }
 
 void REFramework::draw_about() {
@@ -2098,61 +3913,118 @@ void REFramework::draw_about() {
 void REFramework::set_imgui_style() noexcept {
     ImGui::StyleColorsDark();
 
+    // [THEME 10.09.2026] Maße aus dem Style Editor, Tab "Sizes" -- vom User
+    // eingestellt und abgelesen. Bewusst ALLE gesetzt, auch die, die zufaellig
+    // dem ImGui-Default entsprechen: so steht der ganze Satz an einer Stelle
+    // und ein Default-Wechsel in einer neuen ImGui-Version verstellt nichts.
     auto& style = ImGui::GetStyle();
-    style.WindowRounding = 0.0f;
-    style.ChildRounding = 0.0f;
-    style.PopupRounding = 0.0f;
-    style.FrameRounding = 0.0f;
-    style.ScrollbarRounding = 2.0f;
-    style.GrabRounding = 0.0f;
-    style.TabRounding = 0.0f;
-    style.WindowBorderSize = 2.0f;
+
+    // Main
     style.WindowPadding = ImVec2(2.0f, 0.0f);
+    style.FramePadding = ImVec2(4.0f, 3.0f);
+    style.ItemSpacing = ImVec2(4.0f, 4.0f);
+    style.ItemInnerSpacing = ImVec2(4.0f, 4.0f);
+    style.TouchExtraPadding = ImVec2(0.0f, 0.0f);
+    style.IndentSpacing = 3.0f;
+    style.ScrollbarSize = 12.0f;
+    style.GrabMinSize = 15.0f;
 
-    auto& colors = ImGui::GetStyle().Colors;
-    // Window BG
-    colors[ImGuiCol_WindowBg] = ImVec4{0.1f, 0.105f, 0.11f, 1.0f};
+    // Borders
+    style.WindowBorderSize = 3.0f;   // [11.09.2026] erst 1, dann 2 -- rote Umrandung des Menues dicker
+    style.ChildBorderSize = 1.0f;
+    style.PopupBorderSize = 1.0f;
+    style.FrameBorderSize = 1.0f;
 
-    // Navigatation highlight
-    colors[ImGuiCol_NavHighlight] = ImVec4{0.3f, 0.305f, 0.31f, 1.0f};
-
-    // Progress Bar
-    colors[ImGuiCol_PlotHistogram] = ImVec4{0.3f, 0.305f, 0.31f, 1.0f};
-
-    // Headers
-    colors[ImGuiCol_Header] = ImVec4{0.2f, 0.205f, 0.21f, 1.0f};
-    colors[ImGuiCol_HeaderHovered] = ImVec4{0.3f, 0.305f, 0.31f, 1.0f};
-    colors[ImGuiCol_HeaderActive] = ImVec4{0.55f, 0.5505f, 0.551f, 1.0f};
-
-    // Buttons
-    colors[ImGuiCol_Button] = ImVec4{0.2f, 0.205f, 0.21f, 1.0f};
-    colors[ImGuiCol_ButtonHovered] = ImVec4{0.3f, 0.305f, 0.31f, 1.0f};
-    colors[ImGuiCol_ButtonActive] = ImVec4{0.55f, 0.5505f, 0.551f, 1.0f};
-
-    // Checkbox
-    colors[ImGuiCol_CheckMark] = ImVec4(0.55f, 0.5505f, 0.551f, 1.0f);
-
-    // Frame BG
-    colors[ImGuiCol_FrameBg] = ImVec4{0.211f, 0.210f, 0.25f, 1.0f};
-    colors[ImGuiCol_FrameBgHovered] = ImVec4{0.3f, 0.305f, 0.31f, 1.0f};
-    colors[ImGuiCol_FrameBgActive] = ImVec4{0.55f, 0.5505f, 0.551f, 1.0f};
+    // Rounding
+    style.WindowRounding = 7.0f;
+    style.ChildRounding = 0.0f;
+    style.FrameRounding = 5.0f;
+    style.PopupRounding = 0.0f;
+    style.ScrollbarRounding = 2.0f;
+    style.GrabRounding = 3.0f;
 
     // Tabs
-    colors[ImGuiCol_Tab] = ImVec4{0.25f, 0.2505f, 0.251f, 1.0f};
-    colors[ImGuiCol_TabHovered] = ImVec4{0.38f, 0.3805f, 0.381f, 1.0f};
-    colors[ImGuiCol_TabActive] = ImVec4{0.28f, 0.2805f, 0.281f, 1.0f};
-    colors[ImGuiCol_TabUnfocused] = ImVec4{0.25f, 0.2505f, 0.251f, 1.0f};
-    colors[ImGuiCol_TabUnfocusedActive] = ImVec4{0.8f, 0.805f, 0.81f, 1.0f};
+    style.TabBorderSize = 0.0f;
+    style.TabBarBorderSize = 1.0f;
+    style.TabBarOverlineSize = 1.0f;
+    style.TabCloseButtonMinWidthSelected = -1.0f;   // -1 = immer
+    style.TabCloseButtonMinWidthUnselected = 0.0f;
+    style.TabRounding = 0.0f;
 
-    // Resize Grip
-    colors[ImGuiCol_ResizeGrip] = ImVec4{0.2f, 0.205f, 0.21f, 0.0f};
-    colors[ImGuiCol_ResizeGripHovered] = ImVec4{0.3f, 0.305f, 0.31f, 1.0f};
-    colors[ImGuiCol_ResizeGripActive] = ImVec4{0.55f, 0.5505f, 0.551f, 1.0f};
+    // Tables
+    style.CellPadding = ImVec2(4.0f, 2.0f);
+    style.TableAngledHeadersAngle = 35.0f * (3.14159265f / 180.0f);   // 35 Grad
+    style.TableAngledHeadersTextAlign = ImVec2(0.50f, 0.00f);
 
-    // Title
-    colors[ImGuiCol_TitleBg] = ImVec4{0.25f, 0.2505f, 0.251f, 1.0f};
-    colors[ImGuiCol_TitleBgActive] = ImVec4{0.55f, 0.5505f, 0.551f, 1.0f};
-    colors[ImGuiCol_TitleBgCollapsed] = ImVec4{0.25f, 0.2505f, 0.251f, 1.0f};
+    // Windows
+    style.WindowTitleAlign = ImVec2(0.50f, 0.50f);   // Titel mittig
+    style.WindowBorderHoverPadding = 4.0f;
+
+    // [THEME 10.09.2026] Vom User im Style Editor (REF Options) eingestellt und
+    // ueber dessen "Export" (Tab Colors, "Only Modified Colors" aus) 1:1
+    // uebernommen -- Schwarz mit 0.85 Deckkraft, rote Akzente. Vollstaendiger
+    // Satz: was hier steht, gewinnt gegen StyleColorsDark() darueber.
+    // Aendern nur wieder ueber den Style Editor + Export, nicht von Hand raten.
+    // [ONI_MENU 26.09.2026] Die Akzente (in RE9 blau) laufen jetzt ueber
+    // menu_accent(Helligkeit, Deckkraft) aus MENU_ACCENT_COLOR (REFramework.hpp)
+    // -- dort den Farbton aendern, alle Akzente ziehen mit.
+    ImVec4* colors = ImGui::GetStyle().Colors;
+    colors[ImGuiCol_Text]                   = ImVec4(1.00f, 1.00f, 1.00f, 1.00f);
+    colors[ImGuiCol_TextDisabled]           = ImVec4(0.50f, 0.50f, 0.50f, 1.00f);
+    colors[ImGuiCol_WindowBg]               = ImVec4(0.00f, 0.00f, 0.00f, 0.85f);
+    colors[ImGuiCol_ChildBg]                = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+    colors[ImGuiCol_PopupBg]                = ImVec4(0.00f, 0.00f, 0.00f, 0.94f);
+    colors[ImGuiCol_Border]                 = menu_accent(0.60f, 0.50f);   // [ONI_MENU] war blau
+    colors[ImGuiCol_BorderShadow]           = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+    colors[ImGuiCol_FrameBg]                = menu_accent(0.32f, 0.04f);   // [ONI_MENU] war blau
+    colors[ImGuiCol_FrameBgHovered]         = menu_accent(0.63f, 0.40f);   // [ONI_MENU] war blau
+    colors[ImGuiCol_FrameBgActive]          = menu_accent(0.49f, 0.67f);   // [ONI_MENU] war blau
+    colors[ImGuiCol_TitleBg]                = ImVec4(0.04f, 0.04f, 0.04f, 1.00f);
+    colors[ImGuiCol_TitleBgActive]          = ImVec4(0.00f, 0.00f, 0.00f, 0.76f);
+    colors[ImGuiCol_TitleBgCollapsed]       = ImVec4(0.00f, 0.00f, 0.00f, 0.36f);
+    colors[ImGuiCol_MenuBarBg]              = menu_accent(0.93f, 1.00f);   // [ONI_MENU] war blau
+    colors[ImGuiCol_ScrollbarBg]            = ImVec4(0.02f, 0.02f, 0.02f, 0.53f);
+    colors[ImGuiCol_ScrollbarGrab]          = ImVec4(0.31f, 0.31f, 0.31f, 1.00f);
+    colors[ImGuiCol_ScrollbarGrabHovered]   = ImVec4(0.41f, 0.41f, 0.41f, 1.00f);
+    colors[ImGuiCol_ScrollbarGrabActive]    = ImVec4(0.51f, 0.51f, 0.51f, 1.00f);
+    colors[ImGuiCol_CheckMark]              = ImVec4(1.00f, 1.00f, 1.00f, 1.00f);
+    colors[ImGuiCol_SliderGrab]             = menu_accent(0.47f, 1.00f);   // [ONI_MENU] war blau
+    colors[ImGuiCol_SliderGrabActive]       = menu_accent(0.87f, 1.00f);   // [ONI_MENU] war blau
+    colors[ImGuiCol_Button]                 = ImVec4(0.00f, 0.00f, 0.00f, 1.00f);
+    colors[ImGuiCol_ButtonHovered]          = menu_accent(0.40f, 1.00f);   // [ONI_MENU] war blau
+    colors[ImGuiCol_ButtonActive]           = menu_accent(0.87f, 1.00f);   // [ONI_MENU] war blau
+    colors[ImGuiCol_Header]                 = menu_accent(0.93f, 0.00f);   // [ONI_MENU] war blau
+    colors[ImGuiCol_HeaderHovered]          = menu_accent(0.62f, 0.80f);   // [ONI_MENU] war blau
+    colors[ImGuiCol_HeaderActive]           = menu_accent(0.85f, 1.00f);   // [ONI_MENU] war blau
+    colors[ImGuiCol_Separator]              = ImVec4(1.00f, 1.00f, 1.00f, 0.50f);
+    colors[ImGuiCol_SeparatorHovered]       = menu_accent(0.38f, 0.78f);   // [ONI_MENU] war blau
+    colors[ImGuiCol_SeparatorActive]        = menu_accent(0.51f, 1.00f);   // [ONI_MENU] war blau
+    colors[ImGuiCol_ResizeGrip]             = menu_accent(0.98f, 0.20f);   // [ONI_MENU] war blau
+    colors[ImGuiCol_ResizeGripHovered]      = menu_accent(0.66f, 0.67f);   // [ONI_MENU] war blau
+    colors[ImGuiCol_ResizeGripActive]       = menu_accent(0.98f, 0.95f);   // [ONI_MENU] war blau
+    colors[ImGuiCol_TabHovered]             = menu_accent(0.76f, 0.76f);   // [ONI_MENU] war blau
+    colors[ImGuiCol_Tab]                    = menu_accent(0.36f, 0.86f);   // [ONI_MENU] war blau
+    colors[ImGuiCol_TabSelected]            = menu_accent(1.00f, 1.00f);   // [ONI_MENU] war blau
+    colors[ImGuiCol_TabSelectedOverline]    = menu_accent(0.52f, 1.00f);   // [ONI_MENU] war blau
+    colors[ImGuiCol_TabDimmed]              = menu_accent(0.26f, 0.97f);   // [ONI_MENU] war blau
+    colors[ImGuiCol_TabDimmedSelected]      = menu_accent(0.57f, 1.00f);   // [ONI_MENU] war blau
+    colors[ImGuiCol_TabDimmedSelectedOverline] = ImVec4(0.50f, 0.50f, 0.50f, 0.00f);
+    colors[ImGuiCol_PlotLines]              = ImVec4(0.61f, 0.61f, 0.61f, 1.00f);
+    colors[ImGuiCol_PlotLinesHovered]       = ImVec4(1.00f, 0.43f, 0.35f, 1.00f);
+    colors[ImGuiCol_PlotHistogram]          = ImVec4(0.90f, 0.70f, 0.00f, 1.00f);
+    colors[ImGuiCol_PlotHistogramHovered]   = ImVec4(1.00f, 0.60f, 0.00f, 1.00f);
+    colors[ImGuiCol_TableHeaderBg]          = ImVec4(0.19f, 0.19f, 0.20f, 1.00f);
+    colors[ImGuiCol_TableBorderStrong]      = ImVec4(0.31f, 0.31f, 0.35f, 1.00f);
+    colors[ImGuiCol_TableBorderLight]       = ImVec4(0.23f, 0.23f, 0.25f, 1.00f);
+    colors[ImGuiCol_TableRowBg]             = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+    colors[ImGuiCol_TableRowBgAlt]          = ImVec4(1.00f, 1.00f, 1.00f, 0.06f);
+    colors[ImGuiCol_TextLink]               = menu_accent(0.84f, 1.00f);   // [ONI_MENU] war blau
+    colors[ImGuiCol_TextSelectedBg]         = menu_accent(0.98f, 0.35f);   // [ONI_MENU] war blau
+    colors[ImGuiCol_DragDropTarget]         = ImVec4(1.00f, 1.00f, 0.00f, 0.90f);
+    colors[ImGuiCol_NavCursor]              = menu_accent(0.47f, 1.00f);   // [ONI_MENU] Stick-Markierung im Akzent (dunkel wie SliderGrab)
+    colors[ImGuiCol_NavWindowingHighlight]  = ImVec4(1.00f, 1.00f, 1.00f, 0.70f);
+    colors[ImGuiCol_NavWindowingDimBg]      = ImVec4(0.80f, 0.80f, 0.80f, 0.20f);
+    colors[ImGuiCol_ModalWindowDimBg]       = ImVec4(0.80f, 0.80f, 0.80f, 0.35f);
 
     // Font
     set_font_size(m_font_size);
@@ -2720,6 +4592,12 @@ bool REFramework::init_d3d12() {
         auto d3d12_rt_desc = desc;
         d3d12_rt_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; // For VR
 
+        // [VR-MENUE-KONTEXT 11.09.2026] Das VR-Rendertarget (und das leere
+        // Gegenstueck) hat die FESTE Groesse des VR-Menues statt der des
+        // Backbuffers. rt_width/rt_height bleiben unten die Backbuffer-Masse.
+        d3d12_rt_desc.Width = (UINT64)VR_MENU_WIDTH;
+        d3d12_rt_desc.Height = (UINT)VR_MENU_HEIGHT;
+
         D3D12_CLEAR_VALUE clear_value{};
         clear_value.Format = d3d12_rt_desc.Format;
 
@@ -2792,7 +4670,12 @@ bool REFramework::init_d3d12() {
         spdlog::error("[D3D12] Failed to initialize ImGui.");
         return false;
     }
+
     m_d3d12.imgui_backend_datas[1] = ImGui::GetIO().BackendRendererUserData;
+
+    // [ONI_MENU 26.09.2026] Logo des Menues laden. Scheitert es, fehlt nur das
+    // Logo -- kein Grund, D3D12 abzubrechen.
+    create_menu_images_d3d12(device);
 
     return true;
 }

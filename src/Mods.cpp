@@ -1,3 +1,4 @@
+#include <algorithm>   // [ONI_MENU] std::stable_sort in draw_ref_trees
 #include <spdlog/spdlog.h>
 
 #include <sdk/GameIdentity.hpp>
@@ -163,6 +164,41 @@ void Mods::on_post_frame() const {
 void Mods::on_draw_ui() const {
     for (auto& mod : m_mods) {
         mod->on_draw_ui();
+    }
+}
+
+// [ONI_MENU 26.09.2026, aus dem RE9-Fork] Alle REFramework-eigenen Trees in EINER
+// Kategorie ("REFramework Options"), ALPHABETISCH nach angezeigtem Namen
+// ("Hooks" heisst "Performance", "REFrameworkConfig" heisst "Configuration").
+// Anders als in RE9 ohne Ausnahmen: auch der ScriptRunner (Scripts + Script
+// Generated UI) steht hier mit seinem Upstream-Tree.
+void Mods::draw_ref_trees() const {
+    struct Entry {
+        std::string name;
+        Mod* mod;
+    };
+
+    std::vector<Entry> entries{};
+
+    for (const auto& mod : m_mods) {
+        const auto name = mod->get_name();
+        std::string label{name};
+
+        if (name == "Hooks") {
+            label = "Performance";
+        } else if (name == "REFrameworkConfig") {
+            label = "Configuration";
+        }
+
+        entries.push_back({std::move(label), mod.get()});
+    }
+
+    std::stable_sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
+        return a.name < b.name;
+    });
+
+    for (const auto& e : entries) {
+        e.mod->on_draw_ui();
     }
 }
 
