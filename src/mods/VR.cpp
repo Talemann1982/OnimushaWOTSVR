@@ -3144,7 +3144,138 @@ void VR::on_lightshaft_draw(void* shaft, void* render_context) {
 
 thread_local bool timed_out = false;
 
+// [ONI_FARBE 28.09.2026] Engine-Bildregler aus dem Menue (RENDERING) auf die
+// ToneMapping-Komponente der Spielkamera. Jeden Frame vor dem Rendern, weil das
+// Spiel die Werte selbst setzen kann. Nur Regler, die NICHT auf dem Default
+// stehen, werden geschrieben -- auf Default behaelt das Spiel seine eigenen Werte.
+void VR::apply_oni_tonemap() {
+    if (!sdk::GameIdentity::get().is_onimusha_wots()) {
+        return;
+    }
+
+    // [ONI_FARBE] Brightness/Gamma ueber ace.cDisplaySettings. Setter allein wirkt nicht,
+    // erst updateRequest() uebernimmt (Farbtest 28.09.2026). Das Spiel ueberschreibt den
+    // Wert nicht von selbst -> nur schreiben, wenn der Istwert abweicht. Zurueck auf den
+    // Default = einmal den Spielwert von vor unserem ersten Schreiben zuruecksetzen.
+    {
+        auto gm = sdk::get_managed_singleton<::REManagedObject>("app.GraphicsManager");
+        auto gc = gm != nullptr ? sdk::get_object_field<::REManagedObject*>(gm, "_AppGraphicsSettingController") : nullptr;
+        auto ds = (gc != nullptr && *gc != nullptr) ? sdk::get_object_field<::REManagedObject*>(*gc, "_DisplaySettings") : nullptr;
+
+        if (ds != nullptr && *ds != nullptr) {
+            auto obj = *ds;
+            auto ctx = sdk::get_thread_context();
+            bool request = false;
+
+            const auto handle = [&](ModSlider& s, OniDisplayParam& p, const char* getter, const char* setter) {
+                const bool on = s.value() != s.default_value();
+
+                if (on) {
+                    const auto cur = sdk::call_object_func<float>(obj, getter, ctx, obj);
+
+                    if (!p.overriding) {
+                        p.orig = cur;
+                        p.overriding = true;
+                    }
+
+                    if (std::abs(cur - s.value()) > 0.0001f) {
+                        sdk::call_object_func<void*>(obj, setter, ctx, obj, s.value());
+                        request = true;
+                    }
+                } else if (p.overriding) {
+                    if (p.orig) {
+                        sdk::call_object_func<void*>(obj, setter, ctx, obj, *p.orig);
+                        request = true;
+                    }
+
+                    p.overriding = false;
+                    p.orig.reset();
+                }
+            };
+
+            handle(*m_oni_brightness, m_oni_ds_brightness, "get_OutputLowerLimit", "set_OutputLowerLimit");
+            handle(*m_oni_gamma, m_oni_ds_gamma, "get_Gamma", "set_Gamma");
+
+            if (request) {
+                sdk::call_object_func<void*>(obj, "updateRequest", ctx, obj);
+            }
+        }
+    }
+
+    const bool c_on = m_oni_contrast->value() != m_oni_contrast->default_value();
+    const bool s_on = m_oni_shadow_contrast->value() != m_oni_shadow_contrast->default_value();
+    const bool h_on = m_oni_sharpness->value() != m_oni_sharpness->default_value();
+    const bool vfog_off = !m_oni_volumetric_fog->value();
+    const bool ldr_off = !m_oni_ldr_postprocess->value();
+
+    // War aus und ist wieder an -> einmal zurueckschalten.
+    const bool vfog_restore = !vfog_off && m_oni_vfog_forced_off;
+    const bool ldr_restore = !ldr_off && m_oni_ldr_forced_off;
+
+    if (!c_on && !s_on && !h_on && !vfog_off && !vfog_restore && !ldr_off && !ldr_restore) {
+        return;
+    }
+
+    auto camera = sdk::get_primary_camera();
+    auto camera_object = camera != nullptr ? camera->get_game_object() : nullptr;
+
+    if (camera_object == nullptr || camera_object->get_transform() == nullptr) {
+        return;
+    }
+
+    auto context = sdk::get_thread_context();
+
+    // [ONI_FARBE] VolumetricFogControl + LDRPostProcess zusammen flackern im HMD in
+    // Laufrichtung (Flacker-Test 28.09.2026, erst beide aus = ruhig) -> Default AUS.
+    const auto force_enabled = [&](const char* type_name, bool off, bool restore, bool& forced_off) {
+        if (!off && !restore) {
+            return;
+        }
+
+        auto td = sdk::find_type_definition(type_name);
+        auto comp = td != nullptr ? camera_object->get_transform()->find(td->get_type()) : nullptr;
+
+        if (comp != nullptr) {
+            sdk::call_object_func<void*>(comp, "set_Enabled", context, comp, !off);
+            forced_off = off;
+        }
+    };
+
+    force_enabled("via.render.VolumetricFogControl", vfog_off, vfog_restore, m_oni_vfog_forced_off);
+    force_enabled("via.render.LDRPostProcess", ldr_off, ldr_restore, m_oni_ldr_forced_off);
+
+    if (!c_on && !s_on && !h_on) {
+        return;
+    }
+
+    static auto tonemap_typedef = sdk::find_type_definition("via.render.ToneMapping");
+
+    if (tonemap_typedef == nullptr) {
+        return;
+    }
+
+    auto tonemap = camera_object->get_transform()->find(tonemap_typedef->get_type());
+
+    if (tonemap == nullptr) {
+        return;
+    }
+
+    if (c_on) {
+        sdk::call_object_func<void*>(tonemap, "set_Contrast", context, tonemap, m_oni_contrast->value());
+    }
+
+    if (s_on) {
+        sdk::call_object_func<void*>(tonemap, "set_ShadowContrast", context, tonemap, m_oni_shadow_contrast->value());
+    }
+
+    if (h_on) {
+        sdk::call_object_func<void*>(tonemap, "set_Sharpness", context, tonemap, m_oni_sharpness->value());
+    }
+}
+
 void VR::on_pre_begin_rendering(void* entry) {
+    apply_oni_tonemap();   // [ONI_FARBE] auch ohne VR-Runtime (Desktop)
+
     auto runtime = get_runtime();
 
     if (!runtime->loaded) {

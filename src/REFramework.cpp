@@ -3373,6 +3373,26 @@ void REFramework::draw_menu_detail() {
             // derselbe Config-Wert VR_AlternateFrameRendering.
             if (auto& vr = VR::get(); vr != nullptr) {
                 draw_menu_checkbox("Alternate Frame Rendering (AFR)", &vr->afr_value());
+
+                // [ONI_FARBE 28.09.2026] Engine-Bildregler, je ein Reset darunter
+                // (User 28.09.2026). Reset = Wert des Spiels. Reihenfolge laut User:
+                // Brightness, Contrast, Gamma, Sharpness; Post-Process-Schalter unten.
+                const auto slider = [](const char* label, const char* reset_id, ModSlider& s, const char* fmt) {
+                    ImGui::SliderFloat(label, &s.value(), s.range().x, s.range().y, fmt);
+
+                    if (ImGui::Button(reset_id)) {
+                        s.value() = s.default_value();
+                    }
+                };
+
+                slider("Brightness", "Reset##oni_brightness", vr->oni_brightness(), "%.3f");
+                slider("Contrast", "Reset##oni_contrast", vr->oni_contrast(), "%.2f");
+                slider("Shadow Contrast", "Reset##oni_shadow_contrast", vr->oni_shadow_contrast(), "%.2f");
+                slider("Gamma", "Reset##oni_gamma", vr->oni_gamma(), "%.2f");
+                slider("Sharpness", "Reset##oni_sharpness", vr->oni_sharpness(), "%.2f");
+
+                draw_menu_checkbox("Volumetric Fog", &vr->oni_volumetric_fog());   // [ONI_FARBE] Default aus
+                draw_menu_checkbox("LDR Post Process", &vr->oni_ldr_postprocess());   // [ONI_FARBE] Default aus
             }
             break;
         }

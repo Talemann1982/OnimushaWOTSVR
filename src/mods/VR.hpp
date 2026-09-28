@@ -100,6 +100,17 @@ public:
     // [ONI_RENDER] AFR-Schalter fuer die Menue-Kategorie RENDERING (gleicher Config-Wert)
     bool& afr_value() { return m_use_afr->value(); }
 
+    // [ONI_FARBE 28.09.2026] Engine-Bildregler (via.render.ToneMapping der Spielkamera)
+    // fuer die Menue-Kategorie RENDERING. Default = Wert des Spiels; steht ein Regler
+    // auf dem Default, wird nichts geschrieben (das Spiel behaelt seine Werte).
+    ModSlider& oni_contrast() { return *m_oni_contrast; }
+    ModSlider& oni_shadow_contrast() { return *m_oni_shadow_contrast; }
+    ModSlider& oni_sharpness() { return *m_oni_sharpness; }
+    ModSlider& oni_brightness() { return *m_oni_brightness; }
+    ModSlider& oni_gamma() { return *m_oni_gamma; }
+    bool& oni_volumetric_fog() { return m_oni_volumetric_fog->value(); }
+    bool& oni_ldr_postprocess() { return m_oni_ldr_postprocess->value(); }
+
     bool is_using_afr() const {
         return m_use_afr->value();
     }
@@ -333,6 +344,7 @@ private:
     void update_camera_origin(); // every frame
     void update_audio_camera();
     void update_render_matrix();
+    void apply_oni_tonemap();   // [ONI_FARBE]
     void restore_audio_camera(); // after wwise listener update
     void restore_camera(); // After rendering
     void set_lens_distortion(bool value);
@@ -519,6 +531,29 @@ private:
     const ModToggle::Ptr m_use_afr{ ModToggle::create(generate_name("AlternateFrameRendering"), false) };
     const ModToggle::Ptr m_use_custom_view_distance{ ModToggle::create(generate_name("UseCustomViewDistance"), false) };
     const ModToggle::Ptr m_hmd_oriented_audio{ ModToggle::create(generate_name("HMDOrientedAudio"), true) };
+    // [ONI_FARBE] Defaults = Werte des Spiels (Sonde oni_render_sonde 28.09.2026)
+    const ModSlider::Ptr m_oni_contrast{ ModSlider::create(generate_name("OniContrast"), 0.0f, 1.0f, 0.30f) };
+    const ModSlider::Ptr m_oni_shadow_contrast{ ModSlider::create(generate_name("OniShadowContrast"), 0.0f, 2.0f, 0.95f) };
+    const ModSlider::Ptr m_oni_sharpness{ ModSlider::create(generate_name("OniSharpness"), 0.0f, 3.0f, 0.0f) };
+    // [ONI_FARBE] Brightness/Gamma = ace.cDisplaySettings OutputLowerLimit/Gamma
+    // (app.GraphicsManager._AppGraphicsSettingController._DisplaySettings), wirkt nur mit
+    // updateRequest() danach (Farbtest 28.09.2026). Defaults = gemessene Spielwerte.
+    const ModSlider::Ptr m_oni_brightness{ ModSlider::create(generate_name("OniBrightness"), 0.0f, 0.3f, 0.083f) };
+    const ModSlider::Ptr m_oni_gamma{ ModSlider::create(generate_name("OniGamma"), 0.5f, 3.0f, 1.865f) };
+
+    struct OniDisplayParam {
+        std::optional<float> orig{};   // Spielwert vor unserem ersten Schreiben
+        bool overriding{false};
+    };
+    OniDisplayParam m_oni_ds_brightness{};
+    OniDisplayParam m_oni_ds_gamma{};
+
+    // [ONI_FARBE] Volumetrischer Nebel flackert im HMD -> Default AUS (User 28.09.2026)
+    const ModToggle::Ptr m_oni_volumetric_fog{ ModToggle::create(generate_name("OniVolumetricFog"), false) };
+    bool m_oni_vfog_forced_off{false};
+    // [ONI_FARBE] LDRPostProcess flackert zusammen mit dem Nebel -> Default AUS (User 28.09.2026)
+    const ModToggle::Ptr m_oni_ldr_postprocess{ ModToggle::create(generate_name("OniLDRPostProcess"), false) };
+    bool m_oni_ldr_forced_off{false};
     const ModSlider::Ptr m_view_distance{ ModSlider::create(generate_name("CustomViewDistance"), 10.0f, 3000.0f, 500.0f) };
     const ModSlider::Ptr m_motion_controls_inactivity_timer{ ModSlider::create(generate_name("MotionControlsInactivityTimer"), 30.0f, 100.0f, 30.0f) };
     const ModSlider::Ptr m_joystick_deadzone{ ModSlider::create(generate_name("JoystickDeadzone"), 0.01f, 0.9f, 0.15f) };
@@ -571,6 +606,13 @@ private:
         *m_recenter_view_key,
         *m_decoupled_pitch,
         *m_use_afr,
+        *m_oni_contrast,          // [ONI_FARBE]
+        *m_oni_shadow_contrast,   // [ONI_FARBE]
+        *m_oni_sharpness,         // [ONI_FARBE]
+        *m_oni_brightness,        // [ONI_FARBE]
+        *m_oni_gamma,             // [ONI_FARBE]
+        *m_oni_volumetric_fog,    // [ONI_FARBE]
+        *m_oni_ldr_postprocess,   // [ONI_FARBE]
         *m_use_custom_view_distance,
         *m_hmd_oriented_audio,
         *m_view_distance,
