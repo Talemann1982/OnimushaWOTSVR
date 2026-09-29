@@ -94,6 +94,17 @@ sources = ["dependencies/glm/glm/**.cpp"]
 include-directories = ["dependencies/glm"]
 condition = "build-framework-dependencies"
 
+# [AFW 29.09.2026] PureDarks Frame-Warp-Plugin (wie RE9-Fork). Gebaut wird nur ein
+# Dummy zum Linken -- ins Spiel gehoert die ECHTE PDAFWPlugin.dll (aus dem RE9-Ordner).
+[target.pdafwmod]
+type = "shared"
+include-directories = ["dependencies/pd-afwmod/include"]
+sources = ["dependencies/pd-afwmod/dummy/**.cpp"]
+condition = "build-framework-dependencies"
+
+[target.pdafwmod.properties]
+OUTPUT_NAME = "PDAFWPlugin"
+
 [target.minhook]
 type = "static"
 sources = ["dependencies/minhook/src/**.c"]
@@ -236,6 +247,7 @@ link-libraries = [
     "imguizmo",
     "imnodes",
     "minhook",
+    "pdafwmod",
     "d3d11",
     "glm_static",
     "shlwapi",
@@ -271,7 +283,7 @@ add_custom_command(
 
 [target.REFramework.properties]
 OUTPUT_NAME = "dinput8"
-LINK_FLAGS = "/DELAYLOAD:openvr_api.dll /DELAYLOAD:openxr_loader.dll /DELAYLOAD:d3d11.dll /DELAYLOAD:d3d12.dll /DELAYLOAD:D3DCOMPILER_47.dll"
+LINK_FLAGS = "/DELAYLOAD:openvr_api.dll /DELAYLOAD:openxr_loader.dll /DELAYLOAD:PDAFWPlugin.dll /DELAYLOAD:d3d11.dll /DELAYLOAD:d3d12.dll /DELAYLOAD:D3DCOMPILER_47.dll"
 RUNTIME_OUTPUT_DIRECTORY_RELEASE = "${CMAKE_BINARY_DIR}/bin/REFramework"
 RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO = "${CMAKE_BINARY_DIR}/bin/REFramework"
 LIBRARY_OUTPUT_DIRECTORY_RELEASE = "${CMAKE_BINARY_DIR}/lib/REFramework"

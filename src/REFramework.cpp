@@ -2820,6 +2820,13 @@ void REFramework::run_desk_menu_keyboard() {
         if (pad_recenter && !s_recenter_prev) {
             if (auto& vr = VR::get(); vr != nullptr && vr->is_hmd_active()) {
                 vr->recenter_view();
+
+                // [ONI_RECENTER_POS 29.09.2026 -- Ansage des Users] Wie das Runtime-Recenter
+                // (VR.cpp, wants_reset_origin): auch den Standpunkt auf die aktuelle
+                // Kopfposition setzen, sonst bleibt ein Versatz und das Bild sitzt nicht
+                // wieder genau vor einem. recenter_view() allein dreht nur den Yaw.
+                const auto head = vr->get_position(0);
+                vr->set_standing_origin(head);
             }
         }
 
@@ -3372,27 +3379,115 @@ void REFramework::draw_menu_detail() {
             // [ONI_RENDER] Kopie des REFramework-Schalters "Use AFR" (VR-Tree) im Menue-Stil;
             // derselbe Config-Wert VR_AlternateFrameRendering.
             if (auto& vr = VR::get(); vr != nullptr) {
-                draw_menu_checkbox("Alternate Frame Rendering (AFR)", &vr->afr_value());
+                // [POST_PASS 28.09.2026 -- portiert aus dem RE4-Fork] Allgemeine Regler
+                // ganz oben: eigene Schaerfe/Saettigung auf dem fertigen Augenbild.
+                // "##post" als eigene ImGui-ID (die Engine-Sharpness ist seit 29.09. raus).
+                {
+                    // [BRIGHTNESS/CONTRAST 29.09.2026 -- wie RE4-Fork] ueber Sharpness.
+                    int bright = vr->post_brightness_step();
 
-                // [ONI_FARBE 28.09.2026] Engine-Bildregler, je ein Reset darunter
-                // (User 28.09.2026). Reset = Wert des Spiels. Reihenfolge laut User:
-                // Brightness, Contrast, Gamma, Sharpness; Post-Process-Schalter unten.
-                const auto slider = [](const char* label, const char* reset_id, ModSlider& s, const char* fmt) {
-                    ImGui::SliderFloat(label, &s.value(), s.range().x, s.range().y, fmt);
-
-                    if (ImGui::Button(reset_id)) {
-                        s.value() = s.default_value();
+                    if (ImGui::SliderInt("Brightness##post", &bright, -10, 10)) {
+                        vr->post_brightness_step() = std::clamp(bright, -10, 10);
+                        request_save_config();
                     }
-                };
 
-                slider("Brightness", "Reset##oni_brightness", vr->oni_brightness(), "%.3f");
-                slider("Contrast", "Reset##oni_contrast", vr->oni_contrast(), "%.2f");
-                slider("Shadow Contrast", "Reset##oni_shadow_contrast", vr->oni_shadow_contrast(), "%.2f");
-                slider("Gamma", "Reset##oni_gamma", vr->oni_gamma(), "%.2f");
-                slider("Sharpness", "Reset##oni_sharpness", vr->oni_sharpness(), "%.2f");
+                    int contrast = vr->post_contrast_step();
 
-                draw_menu_checkbox("Volumetric Fog", &vr->oni_volumetric_fog());   // [ONI_FARBE] Default aus
-                draw_menu_checkbox("LDR Post Process", &vr->oni_ldr_postprocess());   // [ONI_FARBE] Default aus
+                    if (ImGui::SliderInt("Contrast##post", &contrast, -10, 10)) {
+                        vr->post_contrast_step() = std::clamp(contrast, -10, 10);
+                        request_save_config();
+                    }
+
+                    int sharp = vr->post_sharpness_step();
+
+                    if (ImGui::SliderInt("Sharpness##post", &sharp, 0, 10)) {
+                        vr->post_sharpness_step() = std::clamp(sharp, 0, 10);
+                        request_save_config();
+                    }
+
+                    int sat = vr->post_saturation_step();
+
+                    if (ImGui::SliderInt("Saturation##post", &sat, -10, 10)) {
+                        vr->post_saturation_step() = std::clamp(sat, -10, 10);
+                        request_save_config();
+                    }
+
+                    // Ein Reset unter allen vieren: alles auf 0 (= aus/neutral).
+                    push_menu_toggle_style();
+                    const bool reset_clicked = ImGui::SmallButton("Reset##post");
+                    pop_menu_toggle_style();
+
+                    if (reset_clicked) {
+                        vr->post_brightness_step() = 0;
+                        vr->post_contrast_step() = 0;
+                        vr->post_sharpness_step() = 0;
+                        vr->post_saturation_step() = 0;
+                        request_save_config();
+                    }
+
+                    ImGui::Dummy(ImVec2(0.0f, ImGui::GetTextLineHeight() * 0.5f));
+                }
+
+                // [SEQ_RADIO 29.09.2026 -- Ansage des Users] Auswahlpunkte statt Checkbox,
+                // Two Frame Sequential ueber AFR. Derselbe Config-Wert: AFR aus = praydogs
+                // synchronisiertes Sequential.
+                if (draw_menu_radio("Two Frame Sequential", !vr->afr_value())) {
+                    vr->afr_value() = false;
+                    vr->afw_value() = false;   // [AFW]
+                    request_save_config();
+                }
+
+                // [AFW_HINWEIS 29.09.2026] Ohne Plugin laeuft AFR, auch wenn die Config AFW sagt.
+                const bool afw_available = vr->afw_renderer() != nullptr;
+
+                if (draw_menu_radio("Alternate Frame Rendering (AFR)", vr->afr_value() && (!vr->afw_value() || !afw_available))) {
+                    vr->afr_value() = true;
+                    vr->afw_value() = false;   // [AFW]
+                    request_save_config();
+                }
+
+                // [AFW 29.09.2026 -- Ansage des Users] AFR + Warp des anderen Auges
+                // (PDAFWPlugin.dll). Ohne Plugin im Spielordner ausgegraut.
+                {
+                    if (!afw_available) {
+                        ImGui::BeginDisabled();
+                    }
+
+                    if (draw_menu_radio("Alternate Frame Warping (AFW)", vr->afr_value() && vr->afw_value() && afw_available) && afw_available) {
+                        vr->afr_value() = true;
+                        vr->afw_value() = true;
+                        request_save_config();
+                    }
+
+                    if (!afw_available) {
+                        // [AFW_HINWEIS 29.09.2026 -- Ansage des Users]
+                        ImGui::SameLine();
+                        ImGui::TextUnformatted("(PDAFWPlugin.dll needed)");
+                        ImGui::EndDisabled();
+                    }
+                }
+
+                // [DLSS_PRO_AUGE 28.09.2026] PureDarks Pro-Auge-DLSS/FSR (RE9-Fork)
+                if (draw_menu_checkbox("Fix DLSS/FSR Blur", &vr->fix_upscalers_value())) {
+                    request_save_config();
+                }
+
+                // [ONI_FARBE] Engine-Bildregler (Brightness, Contrast, Shadow Contrast, Gamma,
+                // Sharpness) RAUS (User 29.09.2026): das Spiel startete mit eigenem Wert.
+                // Brightness/Contrast laufen jetzt ueber unseren PostPass oben (wie RE4).
+
+
+                // [POST_PASS 28.09.2026] SMAA ans Ende der Kategorie. Onimusha hat keinen
+                // Upscaler -- die "Upscaler running"-Sperre des RE4-Forks entfaellt hier.
+                draw_menu_heading("POST PROCESSING", true);
+
+                // [29.09.2026 -- User] Engine-Toggles hierher, ueber "Enable SMAA". Default an.
+                draw_menu_checkbox("Volumetric Fog", &vr->oni_volumetric_fog());   // [ONI_FARBE] Default an (29.09.)
+                draw_menu_checkbox("LDR Post Process", &vr->oni_ldr_postprocess());   // [ONI_FARBE] Default an (29.09.)
+
+                if (draw_menu_checkbox("Enable SMAA", &vr->post_smaa())) {
+                    request_save_config();
+                }
             }
             break;
         }

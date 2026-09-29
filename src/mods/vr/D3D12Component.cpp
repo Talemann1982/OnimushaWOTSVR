@@ -7,8 +7,301 @@
 #include <../../directxtk12-src/Inc/RenderTargetState.h>
 
 #include "D3D12Component.hpp"
+#include "AFW.hpp"   // [AFW 29.09.2026]
 
 namespace vrmod {
+// [POST_PASS 28.09.2026 -- Ansage des Users, portiert aus dem RE4-Fork] Eigene
+// Nachbearbeitung wie ReShade: erst SMAA, dann Schaerfe/Saettigung -- auf dem
+// fertigen Augenbild, bevor es in die OpenXR-/OpenVR-Swapchain kopiert wird.
+// Onimusha rendert per AFR (ein Auge pro Frame), ohne Upscaler; `eye` ist der
+// Backbuffer (8 Bit, PRESENT) oder die konvertierte 8-Bit-Textur
+// (PIXEL_SHADER_RESOURCE). Der Backbuffer taugt nicht als SRV -> Arbeitskopie:
+// eye -> m_post_work, Passes an Ort und Stelle auf m_post_work, zurueck nach eye.
+void D3D12Component::apply_post_pass(VR* vr, ID3D12Device* device, ID3D12Resource* eye, D3D12_RESOURCE_STATES eye_state, uint64_t frame_count) {
+    if (vr == nullptr || device == nullptr || eye == nullptr) {
+        return;
+    }
+
+    const float sharp = vr->post_sharpness();
+    const float sat = vr->post_saturation();
+    const float bright = vr->post_brightness();   // [29.09.2026]
+    const float contrast = vr->post_contrast();   // [29.09.2026]
+    const bool smaa = vr->post_smaa();
+
+    if (!smaa && sharp <= 0.0f && sat == 1.0f && bright == 1.0f && contrast == 1.0f) {
+        return;
+    }
+
+    auto desc = eye->GetDesc();
+
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.MipLevels != 1 || desc.DepthOrArraySize != 1) {
+        return;
+    }
+
+    // Typeless-Backbuffer: Arbeitskopie im passenden UNORM/FLOAT-Format
+    // (CopyResource erlaubt das innerhalb derselben Format-Familie).
+    switch (desc.Format) {
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; break;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM; break;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS: desc.Format = DXGI_FORMAT_R10G10B10A2_UNORM; break;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; break;
+    default: break;
+    }
+
+    if (m_post_work != nullptr) {
+        const auto w = m_post_work->GetDesc();
+
+        if (w.Width != desc.Width || w.Height != desc.Height || w.Format != desc.Format) {
+            m_post_work.Reset();
+        }
+    }
+
+    if (m_post_work == nullptr) {
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+        D3D12_RESOURCE_DESC tex{};
+        tex.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        tex.Width = desc.Width;
+        tex.Height = desc.Height;
+        tex.DepthOrArraySize = 1;
+        tex.MipLevels = 1;
+        tex.Format = desc.Format;
+        tex.SampleDesc.Count = 1;
+        tex.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        tex.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+        if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &tex, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                   nullptr, IID_PPV_ARGS(&m_post_work)))) {
+            spdlog::error("[PostPass] Arbeitskopie konnte nicht angelegt werden");
+            return;
+        }
+
+        m_post_work->SetName(L"ONI PostPass work");
+    }
+
+    auto& commands = m_post_commands[frame_count % m_post_commands.size()];
+
+    if (commands.cmd_list == nullptr) {
+        return;
+    }
+
+    commands.wait(INFINITE);
+
+    auto* cmd = commands.cmd_list.Get();
+    auto* work = m_post_work.Get();
+
+    const auto barrier = [cmd](ID3D12Resource* res, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+        if (before == after) {
+            return;
+        }
+
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = res;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = before;
+        b.Transition.StateAfter = after;
+        cmd->ResourceBarrier(1, &b);
+    };
+
+    // eye -> Arbeitskopie (work ruht in COPY_DEST)
+    barrier(eye, eye_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    cmd->CopyResource(work, eye);
+
+    bool any = false;
+
+    if (smaa) {
+        any |= m_smaa_pass.dispatch_inplace(device, cmd, work, D3D12_RESOURCE_STATE_COPY_DEST);
+    }
+
+    any |= m_post_pass.dispatch_inplace(device, cmd, work, D3D12_RESOURCE_STATE_COPY_DEST, sharp, sat, bright, contrast);
+
+    // Arbeitskopie -> eye (nur wenn wirklich etwas bearbeitet wurde)
+    if (any) {
+        barrier(work, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        barrier(eye, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+        cmd->CopyResource(eye, work);
+        barrier(eye, D3D12_RESOURCE_STATE_COPY_DEST, eye_state);
+        barrier(work, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+    } else {
+        barrier(eye, D3D12_RESOURCE_STATE_COPY_SOURCE, eye_state);
+    }
+
+    commands.has_commands = true;
+    commands.execute();
+}
+
+// [AFW 29.09.2026 -- nach RE9-Fork D3D12Component::on_frame "Frame Warp Module"]
+// TextureDesc je Ressource einmal beim Plugin anmelden (Views), danach aus dem Cache.
+static pd::TextureDesc& afw_desc_for(pd::D3D12RendererAPI* r, std::array<pd::TextureDesc, 8>& cache, size_t& next,
+                                     ID3D12Resource* res, D3D12_RESOURCE_STATES state) {
+    for (auto& d : cache) {
+        if (d.pTexture == res && d.initialState == state) {
+            return d;
+        }
+    }
+
+    auto& d = cache[next++ % cache.size()];
+    d = pd::TextureDesc{};
+    d.pTexture = res;
+    d.initialState = state;
+    r->SetupTextureDesc(d);
+    return d;
+}
+
+bool D3D12Component::afw_frame(VR* vr, ID3D12CommandQueue* command_queue, ID3D12Resource* eye_texture,
+                               D3D12_RESOURCE_STATES eye_state, UINT backbuffer_index, vr::EVRCompositorError& e_out) {
+    e_out = vr::VRCompositorError_None;
+
+    auto* r = vr->afw_renderer();
+    auto& st = afw::state();
+
+    if (r == nullptr || eye_texture == nullptr) {
+        return false;
+    }
+
+    auto runtime = vr->get_runtime();
+    const auto eye_desc = eye_texture->GetDesc();
+
+    // Ausgabepuffer des Plugins in Augen-Groesse/-Format (einmal pro Groesse versuchen).
+    if (st.buf_w != (UINT)eye_desc.Width || st.buf_h != eye_desc.Height || st.buf_fmt != eye_desc.Format) {
+        st.buf_w = (UINT)eye_desc.Width;
+        st.buf_h = eye_desc.Height;
+        st.buf_fmt = eye_desc.Format;
+
+        pd::FrameWarpInitParams init{};
+        init.hmdWidth = (int)eye_desc.Width;
+        init.hmdHeight = (int)eye_desc.Height;
+        init.eyeFormat = eye_desc.Format;
+        st.buffers = pd::InitFrameWarp(init);
+    }
+
+    auto& buf_l = st.buffers.eyeFrameBuffers[0].color;
+    auto& buf_r = st.buffers.eyeFrameBuffers[1].color;
+
+    if (buf_l.pTexture == nullptr || buf_r.pTexture == nullptr) {
+        return false;
+    }
+
+    auto& left_ctx = m_openvr.get_left();
+    auto& right_ctx = m_openvr.get_right();
+
+    if (left_ctx.texture == nullptr || right_ctx.texture == nullptr) {
+        return false;
+    }
+
+    static std::array<pd::TextureDesc, 8> s_color_cache{};
+    static size_t s_color_next{0};
+    static std::array<pd::TextureDesc, 8> s_out_cache{};
+    static size_t s_out_next{0};
+
+    auto& color = afw_desc_for(r, s_color_cache, s_color_next, eye_texture, eye_state);
+
+    // Tiefe (on_pre_end_rendering) und daraus die Groesse der MV-Textur.
+    auto* depth = st.depth_tex.load();
+
+    if (depth != st.depth_desc.pTexture) {
+        st.depth_desc = pd::TextureDesc{};
+        st.depth_desc.pTexture = depth;
+        st.depth_desc.initialState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+        if (depth != nullptr) {
+            r->SetupTextureDesc(st.depth_desc);
+            st.depth_desc.type = pd::Depth;
+        }
+    }
+
+    if (depth != nullptr) {
+        const auto dd = depth->GetDesc();
+
+        if (st.mv_desc.pTexture == nullptr || st.mv_desc.pTexture->GetDesc().Width != dd.Width || st.mv_desc.pTexture->GetDesc().Height != dd.Height) {
+            r->CreateTexture((int)dd.Width, (int)dd.Height, DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, st.mv_desc, true);
+        }
+    }
+
+    // UI-Puffer: das Plugin legt das UI unverzerrt drueber statt es mitzuwarpen.
+    auto* ui = vr->m_ui_buffer_tex.load();
+
+    if (ui != st.ui_desc.pTexture) {
+        st.ui_desc = pd::TextureDesc{};
+        st.ui_desc.pTexture = ui;
+        st.ui_desc.initialState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+        if (ui != nullptr) {
+            r->SetupTextureDesc(st.ui_desc);
+        }
+    }
+
+    const int eye = (vr->m_render_frame_count % 2 == vr->m_left_eye_interval) ? 0 : 1;
+    auto* cmd_list = r->BeginCommandList((int)backbuffer_index);
+
+    if (depth != nullptr && st.mv_desc.pTexture != nullptr) {
+        static pd::FrameBufferDesc s_in{};
+        s_in.color = color;
+        s_in.depth = st.depth_desc;
+        s_in.motionVectors = st.mv_desc;
+
+        pd::FrameWarpEvaluateParams params{};
+        params.InCmdList = cmd_list;
+        params.InEyeFrameBuffer = &s_in;
+        params.InUIColorAlpha = st.ui_desc.pTexture != nullptr ? &st.ui_desc : nullptr;
+        params.IsHudlessColor = st.ui_desc.pTexture == nullptr;
+        params.MotionVectorsType = vr->is_fix_dlss() ? pd::Normal : pd::FromOtherEye;
+        params.InMotionScale[0] = (float)eye_desc.Width;
+        params.InMotionScale[1] = (float)eye_desc.Height;
+        params.Mode = pd::CombinedWarping;
+        params.EyeIndex = eye == 0 ? pd::EyeLeft : pd::EyeRight;
+        params.ClearBeforeWarping = false;
+        params.CameraData = &st.camera[eye];
+        params.IgnoreMotionThreshold = 2.5f;
+        params.Debug = false;
+
+        pd::EvaluateFrameWarp(params);
+    } else {
+        // Noch keine Tiefe: nur das gerenderte Auge weiterreichen (anderes Auge = letztes Bild).
+        r->Blit(cmd_list, eye == 0 ? buf_l : buf_r, color);
+    }
+
+    // Plugin-Ergebnis in unsere Augen-Texturen (Format/Groesse gleicht der Blit an).
+    r->Blit(cmd_list, afw_desc_for(r, s_out_cache, s_out_next, left_ctx.texture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE), buf_l);
+    r->Blit(cmd_list, afw_desc_for(r, s_out_cache, s_out_next, right_ctx.texture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE), buf_r);
+
+    r->EndCommandList((int)backbuffer_index);
+
+    if (runtime->is_openxr() && vr->m_openxr->ready()) {
+        m_openxr.copy(0, left_ctx.texture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        m_openxr.copy(1, right_ctx.texture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
+
+    if (runtime->is_openvr()) {
+        vr::D3D12TextureData_t left{left_ctx.texture.Get(), command_queue, 0};
+        vr::Texture_t left_eye{(void*)&left, vr::TextureType_DirectX12, vr::ColorSpace_Auto};
+
+        auto e = vr::VRCompositor()->Submit(vr::Eye_Left, &left_eye, &vr->m_left_bounds);
+
+        if (e != vr::VRCompositorError_None) {
+            e_out = e;
+            return true;
+        }
+
+        vr::D3D12TextureData_t right{right_ctx.texture.Get(), command_queue, 0};
+        vr::Texture_t right_eye{(void*)&right, vr::TextureType_DirectX12, vr::ColorSpace_Auto};
+
+        e = vr::VRCompositor()->Submit(vr::Eye_Right, &right_eye, &vr->m_right_bounds);
+
+        if (e != vr::VRCompositorError_None) {
+            e_out = e;
+            return true;
+        }
+
+        vr->m_submitted = true;
+        ++m_openvr.texture_counter;
+    }
+
+    return true;
+}
+
 vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     if (m_openvr.left_eye_tex[0].texture == nullptr || m_force_reset) {
         setup();
@@ -61,8 +354,28 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     auto runtime = vr->get_runtime();
     const auto frame_count = vr->m_render_frame_count;
 
+    // [POST_PASS 28.09.2026] SMAA/Schaerfe/Saettigung auf das fertige Auge, bevor es
+    // unten in die Swapchain kopiert wird. Zustand: Backbuffer PRESENT, konvertierte
+    // Textur PIXEL_SHADER_RESOURCE (render_srv_to_rtv oben).
+    apply_post_pass(vr, device, eye_texture.Get(),
+                    m_backbuffer_is_8bit ? D3D12_RESOURCE_STATE_PRESENT : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                    frame_count);
+
+    // [AFW 29.09.2026] Warp + beide Augen jeden Frame; sonst der normale AFR-Weg darunter.
+    vr::EVRCompositorError afw_error = vr::VRCompositorError_None;
+    const bool afw_done = vr->is_using_afw()
+        && afw_frame(vr, command_queue, eye_texture.Get(),
+                     m_backbuffer_is_8bit ? D3D12_RESOURCE_STATE_PRESENT : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                     backbuffer_index, afw_error);
+
+    if (afw_error != vr::VRCompositorError_None) {
+        return afw_error;
+    }
+
     // If m_frame_count is even, we're rendering the left eye.
-    if (frame_count % 2 == vr->m_left_eye_interval) {
+    if (afw_done) {
+        // [AFW] schon abgegeben
+    } else if (frame_count % 2 == vr->m_left_eye_interval) {
         // OpenXR texture
         if (runtime->is_openxr() && vr->m_openxr->ready()) {
             m_openxr.copy(0, eye_texture.Get());
@@ -122,7 +435,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 
     vr::EVRCompositorError e = vr::EVRCompositorError::VRCompositorError_None;
 
-    if (frame_count % 2 == vr->m_right_eye_interval) {
+    if (frame_count % 2 == vr->m_right_eye_interval || afw_done) {   // [AFW] jeden Frame
         ////////////////////////////////////////////////////////////////////////////////
         // OpenXR start ////////////////////////////////////////////////////////////////
         ////////////////////////////////////////////////////////////////////////////////
@@ -217,6 +530,15 @@ void D3D12Component::on_reset(VR* vr) {
     for (auto& copier : m_generic_copiers) {
         copier.reset();
     }
+
+    // [POST_PASS 28.09.2026]
+    for (auto& commands : m_post_commands) {
+        commands.reset();
+    }
+
+    m_post_pass.reset();
+    m_smaa_pass.reset();
+    m_post_work.Reset();
     
     m_prev_backbuffer.Reset();
     m_backbuffer_copy.reset();
@@ -336,6 +658,11 @@ void D3D12Component::setup() {
 
     for (auto& copier : m_generic_copiers) {
         copier.setup();
+    }
+
+    // [POST_PASS 28.09.2026]
+    for (auto& commands : m_post_commands) {
+        commands.setup(L"Post Pass Commands");
     }
 
     setup_sprite_batch_pso(rt_desc.Format);
@@ -585,7 +912,7 @@ void D3D12Component::OpenXR::destroy_swapchains() {
     VR::get()->m_openxr->swapchains.clear();
 }
 
-void D3D12Component::OpenXR::copy(uint32_t swapchain_idx, ID3D12Resource* resource) {
+void D3D12Component::OpenXR::copy(uint32_t swapchain_idx, ID3D12Resource* resource, D3D12_RESOURCE_STATES src_state) {
     std::scoped_lock _{this->mtx};
 
     auto& vr = VR::get();
@@ -644,7 +971,7 @@ void D3D12Component::OpenXR::copy(uint32_t swapchain_idx, ID3D12Resource* resour
             texture_ctx->commands.copy(
                 resource, 
                 ctx.textures[texture_index].texture, 
-                D3D12_RESOURCE_STATE_PRESENT, 
+                src_state,   // [AFW 29.09.2026] war fest PRESENT 
                 D3D12_RESOURCE_STATE_RENDER_TARGET);
             texture_ctx->commands.execute();
 

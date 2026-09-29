@@ -1,6 +1,8 @@
 #pragma once
 
+#include <algorithm>   // [POST_PASS 28.09.2026] std::clamp
 #include <chrono>
+#include <cmath>   // [29.09.2026] std::exp2 fuer post_brightness
 #include <bitset>
 #include <memory>
 #include <shared_mutex>
@@ -28,6 +30,10 @@
 
 class REManagedObject;
 
+// [AFW 29.09.2026] PureDarks Frame-Warp-Plugin; der Header selbst nur in VR.cpp
+// (er zieht "using namespace pd" nach sich).
+namespace pd { struct D3D12RendererAPI; }
+
 class VR : public Mod {
 public:
     static std::shared_ptr<VR>& get();
@@ -36,6 +42,21 @@ public:
 
     // Called when the mod is initialized
     std::optional<std::string> on_initialize_d3d_thread() override;
+
+    // [AFW 29.09.2026] nullptr = Plugin fehlt/Dummy -> AFW nie benutzbar.
+    pd::D3D12RendererAPI* afw_renderer() const { return m_afw_renderer; }
+    void update_afw_camera_data();
+    // [AFW_SONDE 29.09.2026] Stimmt die Kamera beim Present mit der des gerenderten Frames
+    // ueberein? Snapshot in on_pre_end_rendering, Vergleich in update_afw_camera_data.
+    // Lua liest per vrmod:get_afw_probe() (Zaehler seit letztem Abruf, danach 0).
+    Matrix4x4f m_afw_end_cam{glm::identity<Matrix4x4f>()};
+    std::atomic<int> m_afw_end_frame{-1};
+    std::atomic<uint32_t> m_afw_probe_frames{0}, m_afw_probe_diff{0}, m_afw_probe_eye_mismatch{0}, m_afw_probe_frame_gap{0};
+    std::atomic<float> m_afw_probe_max_deg{0.0f}, m_afw_probe_max_mm{0.0f};
+    // [AFW_SONDE2 29.09.2026] Kommen die Spiel-MVs in unserer Textur an?
+    std::atomic<uint32_t> m_afw_mv_copied{0}, m_afw_mv_mismatch{0}, m_afw_mv_none{0}, m_afw_mv_notex{0};
+    std::atomic<uint32_t> m_afw_mv_game_w{0}, m_afw_mv_game_h{0}, m_afw_mv_game_fmt{0};
+    std::string get_afw_probe();
 
     void on_lua_state_created(sol::state& lua) override;
 
@@ -99,6 +120,44 @@ public:
 
     // [ONI_RENDER] AFR-Schalter fuer die Menue-Kategorie RENDERING (gleicher Config-Wert)
     bool& afr_value() { return m_use_afr->value(); }
+    // [AFW 29.09.2026] AFW = AFR-Takt + Warp des anderen Auges (PDAFWPlugin.dll).
+    bool& afw_value() { return m_use_afw->value(); }
+
+    // [DLSS_PRO_AUGE 28.09.2026 -- uebernommen von PureDark, RE9-Fork "Fix Upscalers
+    // Wobbling"] Das Spiel-DLSS/FSR hat nur EINE Instanz; bei abwechselnden Augen
+    // mischt sie die Historie beider Augen -> Brei. Wir legen beim Erzeugen eine
+    // zweite Instanz an und leiten jeden Aufruf je nach Auge um; die Bewegungs-
+    // vektoren bekommen die alte Matrix DESSELBEN Auges.
+    bool& fix_upscalers_value() { return m_fix_upscalers_wobbling->value(); }
+    bool is_fix_dlss() const { return m_fix_upscalers_wobbling->value(); }
+    // [RENDER-AUGE 29.09.2026] War m_frame_count: den erhoeht der Hauptthread schon fuer
+    // den NAECHSTEN Frame, waehrend DLSS noch den vorigen rendert -> im Spiel wechselnd
+    // falsches Auge, beide Instanzen bekamen gemischte Augen (Fix wirkte nur bei offenem
+    // Menue, User 29.09.). m_render_frame_count ist das Auge des gerade gerenderten
+    // Frames -- dieselbe Quelle, die auch die Augenbild-Abgabe benutzt.
+    // [ZURUECK AUF EINBAU-FASSUNG 29.09.2026 -- User] Augenwahl wieder ueber m_frame_count
+    // (Render-Frame- und Projektions-Varianten brachten keine Verbesserung).
+    int afr_eye() const { return (m_frame_count % 2 == m_left_eye_interval) ? 0 : 1; }
+    // [AUGE FESTHALTEN 29.09.2026] Auge, mit dem die Bewegungsvektoren DIESES Frames
+    // gesetzt wurden (on_scene_layer_update). Die DLSS-Auswertung desselben Frames nimmt
+    // genau dieses -- sonst konnte m_frame_count dazwischen schon weitergezaehlt sein
+    // (Flackern, weg bei offenem ImGui = anderes Timing; User 29.09.).
+    std::atomic<int> m_dlss_eye{-1};
+    int dlss_eye() const { const int e = m_dlss_eye.load(); return e >= 0 ? e : afr_eye(); }
+    int dlss_frame_count() const { return m_frame_count; }
+    void* vrDLSSHandle[2]{nullptr, nullptr};   // NVSDK_NGX_Handle*
+    void* vrContexts[2]{nullptr, nullptr};     // ffxContext
+    // Frame, in dem zuletzt ein Upscaler-Aufruf ueber UNSERE Pro-Auge-Instanz lief.
+    // Nur dann wird die Bewegungsvektor-Korrektur angewandt -- ohne Upscaler bleibt
+    // der alte TAA-Fix (sonst Geisterbilder mit dem Spiel-TAA).
+    std::atomic<int> m_upscaler_eye_frame{-1000};
+    // [DLSS_SONDE 29.09.2026] nur zaehlen, Lua liest per vrmod:get_dlss_probe()
+    std::atomic<uint32_t> m_dlss_eval_total{0}, m_dlss_eval_eye[2]{}, m_dlss_eval_other{0},
+        m_dlss_eval_fixoff{0}, m_dlss_eval_nosecond{0}, m_dlss_creates{0}, m_dlss_releases{0};
+    std::atomic<uint64_t> m_dlss_eye_seq{0};   // letzte 16 Augen der Evaluates als Bits
+    std::string get_dlss_probe();
+    bool upscaler_per_eye_active() const { return is_fix_dlss() && (m_frame_count - m_upscaler_eye_frame.load()) < 10; }
+    void install_upscaler_hooks();
 
     // [ONI_FARBE 28.09.2026] Engine-Bildregler (via.render.ToneMapping der Spielkamera)
     // fuer die Menue-Kategorie RENDERING. Default = Wert des Spiels; steht ein Regler
@@ -110,6 +169,25 @@ public:
     ModSlider& oni_gamma() { return *m_oni_gamma; }
     bool& oni_volumetric_fog() { return m_oni_volumetric_fog->value(); }
     bool& oni_ldr_postprocess() { return m_oni_ldr_postprocess->value(); }
+
+    // [POST_PASS 28.09.2026] Eigene Nachbearbeitung auf dem Augenbild (portiert aus
+    // dem RE4-Fork). Menue ganze Stufen: Schaerfe 0..10 (0 = aus) -> 0.0..3.0,
+    // Saettigung -10..10 (0 = neutral) -> 0.0..2.0, SMAA an/aus.
+    int32_t& post_sharpness_step() { return m_post_sharpness->value(); }
+    int32_t& post_saturation_step() { return m_post_saturation->value(); }
+    bool& post_smaa() { return m_post_smaa->value(); }
+    float post_sharpness() const { return (float)std::clamp(m_post_sharpness->value(), 0, 10) * 0.3f; }
+    float post_saturation() const { return (float)(std::clamp(m_post_saturation->value(), -10, 10) + 10) * 0.1f; }
+    // [BRIGHTNESS/CONTRAST 29.09.2026 -- wie RE4-Fork] Menue -10..10, 0 = neutral.
+    int32_t& post_brightness_step() { return m_post_brightness->value(); }
+    int32_t& post_contrast_step() { return m_post_contrast->value(); }
+    float post_brightness() const { return std::exp2(-(float)std::clamp(m_post_brightness->value(), -10, 10) * 0.1f); }
+    float post_contrast() const { return 1.0f + (float)std::clamp(m_post_contrast->value(), -10, 10) * 0.05f; }
+
+    // [AFW 29.09.2026] Nur wirksam mit AFR und geladenem Plugin.
+    bool is_using_afw() const {
+        return m_use_afr->value() && m_use_afw->value() && m_afw_renderer != nullptr;
+    }
 
     bool is_using_afr() const {
         return m_use_afr->value();
@@ -273,6 +351,12 @@ private:
     };
 
     std::array<SceneLayerData, 5> m_scene_layer_data {};
+    // [DLSS_PRO_AUGE] View-Matrix des letzten Frames je Auge, je SceneInfo-Slot
+    // (m_scene_layer_data wird pro Frame neu gebaut, deshalb getrennt gehalten).
+    std::array<std::array<Matrix4x4f, 2>, 5> m_old_view_matrix{};
+    bool m_ngx_hooked{false};
+    bool m_ffx_hooked{false};
+    int m_upscaler_hook_try_frame{0};
 
     static void wwise_listener_update_hook(void* listener);
 
@@ -493,6 +577,9 @@ private:
     bool m_needs_camera_restore{false};
     bool m_needs_audio_restore{false};
     bool m_in_render{false};
+    // [AFR_LATCH 29.09.2026] Spielkamera des ersten Auges, gilt fuer das zweite Auge
+    Matrix4x4f m_afr_latch_view{ glm::identity<Matrix4x4f>() };
+    int m_afr_latch_frame{-1};
     // [ONI_UIBUF] zuletzt gesehener UI-Puffer der Overlay-Schicht (in D3D12Component geleert)
     std::atomic<ID3D12Resource*> m_ui_buffer_tex{nullptr};
     bool m_in_lightshaft{false};
@@ -528,7 +615,11 @@ private:
     const ModKey::Ptr m_set_standing_key{ ModKey::create(generate_name("SetStandingOriginKey")) };
     const ModKey::Ptr m_recenter_view_key{ ModKey::create(generate_name("RecenterViewKey")) };
     const ModToggle::Ptr m_decoupled_pitch{ ModToggle::create(generate_name("DecoupledPitch"), false) };
-    const ModToggle::Ptr m_use_afr{ ModToggle::create(generate_name("AlternateFrameRendering"), false) };
+    pd::D3D12RendererAPI* m_afw_renderer{nullptr};   // [AFW 29.09.2026]
+
+    const ModToggle::Ptr m_use_afw{ ModToggle::create(generate_name("AlternateFrameWarping"), false) };   // [AFW 29.09.2026]
+    const ModToggle::Ptr m_use_afr{ ModToggle::create(generate_name("AlternateFrameRendering"), true) };   // [DEFAULT AN 29.09.2026] User: AFR + DLSS-Fix sieht super aus
+    const ModToggle::Ptr m_fix_upscalers_wobbling{ ModToggle::create(generate_name("FixUpscalersWobbling"), true) };   // [DLSS_PRO_AUGE]
     const ModToggle::Ptr m_use_custom_view_distance{ ModToggle::create(generate_name("UseCustomViewDistance"), false) };
     const ModToggle::Ptr m_hmd_oriented_audio{ ModToggle::create(generate_name("HMDOrientedAudio"), true) };
     // [ONI_FARBE] Defaults = Werte des Spiels (Sonde oni_render_sonde 28.09.2026)
@@ -549,11 +640,19 @@ private:
     OniDisplayParam m_oni_ds_gamma{};
 
     // [ONI_FARBE] Volumetrischer Nebel flackert im HMD -> Default AUS (User 28.09.2026)
-    const ModToggle::Ptr m_oni_volumetric_fog{ ModToggle::create(generate_name("OniVolumetricFog"), false) };
+    // [DEFAULT AN 29.09.2026 -- User: Engine-Toggles bleiben, erstmal normal = an]
+    // Neuer Config-Name (_V2), damit ein gespeichertes "aus" nicht weiter gilt.
+    const ModToggle::Ptr m_oni_volumetric_fog{ ModToggle::create(generate_name("OniVolumetricFog_V2"), true) };
     bool m_oni_vfog_forced_off{false};
     // [ONI_FARBE] LDRPostProcess flackert zusammen mit dem Nebel -> Default AUS (User 28.09.2026)
-    const ModToggle::Ptr m_oni_ldr_postprocess{ ModToggle::create(generate_name("OniLDRPostProcess"), false) };
+    const ModToggle::Ptr m_oni_ldr_postprocess{ ModToggle::create(generate_name("OniLDRPostProcess_V2"), true) };
     bool m_oni_ldr_forced_off{false};
+    // [POST_PASS 28.09.2026] s. post_sharpness()/post_saturation()/post_smaa()
+    const ModInt32::Ptr m_post_sharpness{ ModInt32::create(generate_name("PostSharpness"), 0) };
+    const ModInt32::Ptr m_post_saturation{ ModInt32::create(generate_name("PostSaturation_V2"), 0) };
+    const ModToggle::Ptr m_post_smaa{ ModToggle::create(generate_name("PostSMAA"), false) };
+    const ModInt32::Ptr m_post_brightness{ ModInt32::create(generate_name("PostBrightness"), 0) };   // [29.09.2026]
+    const ModInt32::Ptr m_post_contrast{ ModInt32::create(generate_name("PostContrast"), 0) };       // [29.09.2026]
     const ModSlider::Ptr m_view_distance{ ModSlider::create(generate_name("CustomViewDistance"), 10.0f, 3000.0f, 500.0f) };
     const ModSlider::Ptr m_motion_controls_inactivity_timer{ ModSlider::create(generate_name("MotionControlsInactivityTimer"), 30.0f, 100.0f, 30.0f) };
     const ModSlider::Ptr m_joystick_deadzone{ ModSlider::create(generate_name("JoystickDeadzone"), 0.01f, 0.9f, 0.15f) };
@@ -606,6 +705,8 @@ private:
         *m_recenter_view_key,
         *m_decoupled_pitch,
         *m_use_afr,
+        *m_use_afw,   // [AFW 29.09.2026]
+        *m_fix_upscalers_wobbling,   // [DLSS_PRO_AUGE]
         *m_oni_contrast,          // [ONI_FARBE]
         *m_oni_shadow_contrast,   // [ONI_FARBE]
         *m_oni_sharpness,         // [ONI_FARBE]
@@ -613,6 +714,11 @@ private:
         *m_oni_gamma,             // [ONI_FARBE]
         *m_oni_volumetric_fog,    // [ONI_FARBE]
         *m_oni_ldr_postprocess,   // [ONI_FARBE]
+        *m_post_sharpness,        // [POST_PASS]
+        *m_post_saturation,       // [POST_PASS]
+        *m_post_smaa,             // [POST_PASS]
+        *m_post_brightness,       // [29.09.2026]
+        *m_post_contrast,         // [29.09.2026]
         *m_use_custom_view_distance,
         *m_hmd_oriented_audio,
         *m_view_distance,

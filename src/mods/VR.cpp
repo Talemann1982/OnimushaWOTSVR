@@ -57,6 +57,10 @@
 
 #include "utility/Scan.hpp"
 #include "utility/FunctionHook.hpp"
+#include <format>   // [DLSS_SONDE 29.09.2026]
+#include "utility/FunctionHookMinHook.hpp"   // [DLSS_PRO_AUGE 28.09.2026]
+#include "vr/AFW.hpp"   // [AFW 29.09.2026] PureDarks Frame-Warp-Plugin (RE9-Fork)
+#include "vr/UpscaleHelper.hpp"               // [DLSS_PRO_AUGE] NGX/FFX-Deklarationen (PureDark, RE9-Fork)
 #include "utility/Module.hpp"
 #include "utility/Memory.hpp"
 #include "utility/Registry.hpp"
@@ -320,6 +324,26 @@ void VR::on_camera_get_view_matrix(REManagedObject* camera, Matrix4x4f* result) 
             head[3] = Vector4f{head_position.x, head_position.y, head_position.z, 1.0f};
         }
 
+        // [AFR_LATCH 29.09.2026 -- Ansage des Users] Bei AFR rendert jedes Auge einen
+        // eigenen Frame; dreht der Stick die 3rd-Person-Kamera, stehen beide Augen an
+        // verschiedenen Punkten der Kreisbahn -> Schielen. Das erste Auge eines Paars
+        // merkt sich die Spielkamera, das zweite Auge (direkt folgender Frame) rendert
+        // mit genau dieser. Nur im Render-Fenster, damit Spiellogik (Zielen, Culling
+        // ausserhalb) die aktuelle Kamera behaelt. Springt die Kamera (Schnitt), verworfen.
+        if (is_using_afr() && !is_using_afw() && m_in_render) {
+            if (afr_eye() == 0) {
+                m_afr_latch_view = mtx;
+                m_afr_latch_frame = m_frame_count;
+            } else if (m_afr_latch_frame >= 0 && m_frame_count - m_afr_latch_frame == 1) {
+                const auto live_pos = Vector3f{glm::inverse(mtx)[3]};
+                const auto latch_pos = Vector3f{glm::inverse(m_afr_latch_view)[3]};
+
+                if (glm::length(live_pos - latch_pos) < 1.0f) {
+                    mtx = m_afr_latch_view;
+                }
+            }
+        }
+
         mtx = current_eye_transform * glm::inverse(head) * mtx;
         return;
     }
@@ -531,6 +555,23 @@ bool VR::on_pre_scene_layer_update(sdk::renderer::layer::Scene* layer, void* ren
     }
 
     auto scene_info = layer->get_scene_info();
+
+    // [AUGE AUS PROJEKTION 29.09.2026, 2. Anlauf -- per Sonde: m_frame_count ist auf dem
+    // Render-Thread ein Wettlauf (seq=RRLRRRRRL.., nur mit offenem ImGui sauber)]
+    // Das Auge, das die Engine WIRKLICH gerendert hat, steckt in der Projektion der
+    // Szene: die beiden Augen haben unterschiedlich schraege Projektionen ([2][0]),
+    // der DLSS-Jitter ist dagegen winzig. Bewegungsvektoren UND DLSS-Instanz nehmen
+    // dieses Auge (m_dlss_eye).
+    if (scene_info != nullptr) {
+        std::shared_lock _{get_runtime()->projections_mtx};
+        const auto& pr = get_runtime()->projections;
+        const float x = scene_info->projection_matrix[2][0];
+
+        if (std::abs(pr[0][2][0] - pr[1][2][0]) > 1e-4f) {
+            m_dlss_eye = std::abs(x - pr[0][2][0]) <= std::abs(x - pr[1][2][0]) ? 0 : 1;
+        }
+    }
+
     auto depth_distortion_scene_info = layer->get_depth_distortion_scene_info();
     auto filter_scene_info = layer->get_filter_scene_info();
     auto jitter_disable_scene_info = layer->get_jitter_disable_scene_info();
@@ -558,10 +599,28 @@ void VR::on_scene_layer_update(sdk::renderer::layer::Scene* layer, void* render_
     }
 
     if (m_set_next_scene_layer_data) {
-        for (auto& d : m_scene_layer_data) {
-            if (d.scene_info != nullptr) {
+        // [DLSS_PRO_AUGE 28.09.2026 -- PureDark/RE9-Fork] Laeuft das Spiel-DLSS/FSR
+        // ueber unsere Pro-Auge-Instanzen, zeigen die Bewegungsvektoren auf den
+        // letzten Frame DESSELBEN Auges: old_vp = Projektion(Auge) * alte View(Auge).
+        // Sonst wie bisher der TAA-Fix (old_vp = aktuelle vp).
+        const int eye = dlss_eye();   // [AUGE AUS PROJEKTION] in on_pre_scene_layer_update erkannt
+        const bool per_eye = upscaler_per_eye_active();
+
+        for (size_t i = 0; i < m_scene_layer_data.size(); ++i) {
+            auto& d = m_scene_layer_data[i];
+
+            if (d.scene_info == nullptr) {
+                continue;
+            }
+
+            // [ZURUECK AUF EINBAU-FASSUNG 29.09.2026] wie RE9-Vorlage
+            if (per_eye) {
+                d.scene_info->old_view_projection_matrix = get_runtime()->projections[eye] * m_old_view_matrix[i][eye];
+            } else {
                 d.scene_info->old_view_projection_matrix = d.view_projection_matrix;
             }
+
+            m_old_view_matrix[i][eye] = d.scene_info->view_matrix;
         }
 
         m_set_next_scene_layer_data = false;
@@ -642,8 +701,283 @@ float VR::get_sharpness_hook(void* tonemapping) {
 }
 */
 
+// ============================================================================
+// [DLSS_PRO_AUGE 28.09.2026 -- uebernommen von PureDark, RE9-Fork VR.cpp
+// hk_NVSDK_NGX_* / hk_ffx*] Kern ohne AFW-/Foveated-Teile.
+// Abweichung von der Vorlage: hk_ffxCreateContext rief dort das Original ZWEIMAL
+// fuer denselben Kontext auf (ein Kontext ging verloren) -- hier nur einmal.
+// ============================================================================
+NVSDK_NGX_Result hk_NVSDK_NGX_D3D12_CreateFeature(
+    ID3D12GraphicsCommandList* InCmdList, NVSDK_NGX_Feature InFeatureID, NVSDK_NGX_Parameter* InParameters, NVSDK_NGX_Handle** OutHandle) {
+    auto result = o_NVSDK_NGX_D3D12_CreateFeature(InCmdList, InFeatureID, InParameters, OutHandle);
+    const auto& vr = VR::get();
+
+    if (vr != nullptr) {
+        ++vr->m_dlss_creates;   // [DLSS_SONDE]
+    }
+
+    // [NEUESTES DLSS 29.09.2026 -- per Sonde belegt] Das Spiel legt beim Neuaufbau das
+    // NEUE DLSS an, BEVOR es das alte freigibt (creates=3 releases=2, danach liefen alle
+    // Auswertungen am Fix vorbei). Deshalb immer das ZULETZT angelegte uebernehmen:
+    // alte zweite Instanz freigeben, fuer das neue eine frische anlegen.
+    if (vr != nullptr && NVSDK_NGX_SUCCEED(result) && OutHandle != nullptr
+        && (InFeatureID == NVSDK_NGX_Feature_SuperSampling || InFeatureID == NVSDK_NGX_Feature_RayReconstruction)) {
+        if (vr->vrDLSSHandle[1] != nullptr) {
+            o_NVSDK_NGX_D3D12_ReleaseFeature((NVSDK_NGX_Handle*)vr->vrDLSSHandle[1]);
+            vr->vrDLSSHandle[1] = nullptr;
+        }
+
+        vr->vrDLSSHandle[0] = *OutHandle;
+        NVSDK_NGX_Handle* second = nullptr;
+        auto result2 = o_NVSDK_NGX_D3D12_CreateFeature(InCmdList, InFeatureID, InParameters, &second);
+        vr->vrDLSSHandle[1] = NVSDK_NGX_SUCCEED(result2) ? second : nullptr;
+        spdlog::info("[DLSS_PRO_AUGE] zweite DLSS-Instanz: 0x{:x}", (int64_t)result2);
+    }
+
+    return result;
+}
+
+NVSDK_NGX_Result hk_NVSDK_NGX_D3D12_ReleaseFeature(NVSDK_NGX_Handle* InHandle) {
+    const auto& vr = VR::get();
+
+    if (vr != nullptr) {
+        ++vr->m_dlss_releases;   // [DLSS_SONDE]
+    }
+
+    if (vr != nullptr && InHandle != nullptr && vr->vrDLSSHandle[0] == InHandle) {
+        vr->vrDLSSHandle[0] = nullptr;
+
+        if (vr->vrDLSSHandle[1] != nullptr) {
+            o_NVSDK_NGX_D3D12_ReleaseFeature((NVSDK_NGX_Handle*)vr->vrDLSSHandle[1]);
+            vr->vrDLSSHandle[1] = nullptr;
+        }
+    }
+
+    return o_NVSDK_NGX_D3D12_ReleaseFeature(InHandle);
+}
+
+NVSDK_NGX_Result hk_NVSDK_NGX_D3D12_EvaluateFeature(
+    ID3D12GraphicsCommandList* InCmdList, const NVSDK_NGX_Handle* InFeatureHandle, NVSDK_NGX_Parameter* InParameters, void* InCallback) {
+    const auto& vr = VR::get();
+
+    // [DLSS_SONDE 29.09.2026] nur zaehlen, warum (nicht) umgeleitet wird
+    if (vr != nullptr) {
+        ++vr->m_dlss_eval_total;
+
+        if (InFeatureHandle != vr->vrDLSSHandle[0]) {
+            ++vr->m_dlss_eval_other;
+        } else if (!vr->is_fix_dlss()) {
+            ++vr->m_dlss_eval_fixoff;
+        } else if (vr->vrDLSSHandle[1] == nullptr) {
+            ++vr->m_dlss_eval_nosecond;
+        } else {
+            const int e = vr->dlss_eye();
+            ++vr->m_dlss_eval_eye[e];
+            vr->m_dlss_eye_seq = ((vr->m_dlss_eye_seq.load() << 1) | (uint64_t)e) & 0xFFFF;
+        }
+    }
+
+    // [AFW 29.09.2026 -- RE9-Fork] Die Bewegungsvektoren des Spiels in unsere eigene
+    // Textur kopieren; der Warp braucht sie beim Present. Nur bei passender Groesse/Format.
+    if (vr != nullptr && vr->is_using_afw() && vr->is_hmd_active() && InCmdList != nullptr && InParameters != nullptr) {
+        auto& afw_state = afw::state();
+        ID3D12Resource* motion_vectors{nullptr};
+        InParameters->Get(NVSDK_NGX_Parameter_MotionVectors, &motion_vectors);
+
+        if (motion_vectors == nullptr) {
+            ++vr->m_afw_mv_none;   // [AFW_SONDE2]
+        } else if (afw_state.mv_desc.pTexture == nullptr) {
+            ++vr->m_afw_mv_notex;   // [AFW_SONDE2]
+        }
+
+        if (motion_vectors != nullptr && afw_state.mv_desc.pTexture != nullptr) {
+            const auto desc1 = motion_vectors->GetDesc();
+            const auto desc2 = afw_state.mv_desc.pTexture->GetDesc();
+
+            vr->m_afw_mv_game_w = (uint32_t)desc1.Width;   // [AFW_SONDE2]
+            vr->m_afw_mv_game_h = desc1.Height;
+            vr->m_afw_mv_game_fmt = (uint32_t)desc1.Format;
+
+            if (std::abs((float)desc1.Width - (float)desc2.Width) <= 2.0f && std::abs((float)desc1.Height - (float)desc2.Height) <= 2.0f
+                && desc1.Format == desc2.Format) {
+                pd::TextureDesc src{};
+                src.pTexture = motion_vectors;
+                vr->afw_renderer()->Copy(InCmdList, afw_state.mv_desc, src);
+                ++vr->m_afw_mv_copied;   // [AFW_SONDE2]
+            } else {
+                ++vr->m_afw_mv_mismatch;   // [AFW_SONDE2]
+            }
+        }
+    }
+
+    if (vr != nullptr && vr->is_hmd_active() && vr->is_fix_dlss() && InFeatureHandle != nullptr
+        && InFeatureHandle == vr->vrDLSSHandle[0] && vr->vrDLSSHandle[1] != nullptr) {
+        // Auge des gerade gerenderten Frames -> eigene Instanz (eigene Historie)
+        auto* handle = (const NVSDK_NGX_Handle*)vr->vrDLSSHandle[vr->dlss_eye()];   // [AUGE FESTHALTEN]
+        vr->m_upscaler_eye_frame = vr->dlss_frame_count();
+        return o_NVSDK_NGX_D3D12_EvaluateFeature(InCmdList, handle, InParameters, InCallback);
+    }
+
+    return o_NVSDK_NGX_D3D12_EvaluateFeature(InCmdList, InFeatureHandle, InParameters, InCallback);
+}
+
+ffxReturnCode_t hk_ffxCreateContext(ffxContext* context, ffxCreateContextDescHeader* desc, const void** memCb) {
+    auto result = o_ffxCreateContext(context, desc, memCb);
+    const auto& vr = VR::get();
+
+    // [NEUESTES FSR 29.09.2026] wie bei DLSS: immer den zuletzt angelegten Kontext uebernehmen
+    if (vr != nullptr && result == 0 && desc != nullptr && context != nullptr && desc->type == FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE) {
+        if (vr->vrContexts[1] != nullptr) {
+            ffxContext old_second = vr->vrContexts[1];
+            o_ffxDestroyContext(&old_second, memCb);
+            vr->vrContexts[1] = nullptr;
+        }
+
+        vr->vrContexts[0] = *context;
+        ffxContext second = nullptr;
+        auto result2 = o_ffxCreateContext(&second, desc, memCb);
+        vr->vrContexts[1] = result2 == 0 ? second : nullptr;
+        spdlog::info("[DLSS_PRO_AUGE] zweiter FSR-Kontext: 0x{:x}", (int64_t)result2);
+    }
+
+    return result;
+}
+
+ffxReturnCode_t hk_ffxDestroyContext(ffxContext* context, const void** memCb) {
+    const auto& vr = VR::get();
+
+    if (vr != nullptr && context != nullptr && *context != nullptr && *context == vr->vrContexts[0]) {
+        vr->vrContexts[0] = nullptr;
+
+        if (vr->vrContexts[1] != nullptr) {
+            ffxContext second = vr->vrContexts[1];
+            o_ffxDestroyContext(&second, memCb);
+            vr->vrContexts[1] = nullptr;
+        }
+    }
+
+    return o_ffxDestroyContext(context, memCb);
+}
+
+ffxReturnCode_t hk_ffxDispatch(ffxContext* context, const ffxDispatchDescHeader* desc) {
+    const auto& vr = VR::get();
+
+    if (vr != nullptr && desc != nullptr && desc->type == FFX_API_DISPATCH_DESC_TYPE_UPSCALE && vr->is_hmd_active()
+        && vr->is_fix_dlss() && context != nullptr && *context != nullptr && *context == vr->vrContexts[0]
+        && vr->vrContexts[1] != nullptr) {
+        ffxContext eye_ctx = vr->vrContexts[vr->dlss_eye()];   // [AUGE FESTHALTEN]
+        vr->m_upscaler_eye_frame = vr->dlss_frame_count();
+        return o_ffxDispatch(&eye_ctx, desc);
+    }
+
+    return o_ffxDispatch(context, desc);
+}
+
+namespace {
+std::unique_ptr<FunctionHookMinHook> g_ngx_create_hook{};
+std::unique_ptr<FunctionHookMinHook> g_ngx_release_hook{};
+std::unique_ptr<FunctionHookMinHook> g_ngx_evaluate_hook{};
+std::unique_ptr<FunctionHookMinHook> g_ffx_create_hook{};
+std::unique_ptr<FunctionHookMinHook> g_ffx_destroy_hook{};
+std::unique_ptr<FunctionHookMinHook> g_ffx_dispatch_hook{};
+
+template <typename T>
+bool dlss_hook(std::unique_ptr<FunctionHookMinHook>& h, HMODULE mod, const char* name, void* dest, T& original) {
+    auto target = mod != nullptr ? GetProcAddress(mod, name) : nullptr;
+
+    if (target == nullptr) {
+        spdlog::error("[DLSS_PRO_AUGE] Export {} fehlt", name);
+        return false;
+    }
+
+    h = std::make_unique<FunctionHookMinHook>((uintptr_t)target, (uintptr_t)dest);
+
+    if (!h->create()) {
+        spdlog::error("[DLSS_PRO_AUGE] Hook {} fehlgeschlagen", name);
+        h.reset();
+        return false;
+    }
+
+    original = (T)h->get_original();
+    return true;
+}
+}
+
+// Wie im RE9-Fork beim Init; weil nvngx/FFX evtl. erst spaeter geladen werden,
+// zusaetzlich alle ~180 Frames aus on_present nachversucht, bis beide sitzen.
+void VR::install_upscaler_hooks() {
+    if (!m_ngx_hooked) {
+        auto dll = GetModuleHandleA("_nvngx.dll");
+
+        if (dll == nullptr) {
+            dll = GetModuleHandleA("nvngx.dll");
+        }
+
+        if (dll != nullptr) {
+            const bool ok = dlss_hook(g_ngx_create_hook, dll, "NVSDK_NGX_D3D12_CreateFeature", (void*)&hk_NVSDK_NGX_D3D12_CreateFeature, o_NVSDK_NGX_D3D12_CreateFeature)
+                && dlss_hook(g_ngx_release_hook, dll, "NVSDK_NGX_D3D12_ReleaseFeature", (void*)&hk_NVSDK_NGX_D3D12_ReleaseFeature, o_NVSDK_NGX_D3D12_ReleaseFeature)
+                && dlss_hook(g_ngx_evaluate_hook, dll, "NVSDK_NGX_D3D12_EvaluateFeature", (void*)&hk_NVSDK_NGX_D3D12_EvaluateFeature, o_NVSDK_NGX_D3D12_EvaluateFeature);
+            spdlog::info("[DLSS_PRO_AUGE] NGX-Hooks: {}", ok);
+
+            if (!ok) {
+                g_ngx_evaluate_hook.reset();
+                g_ngx_release_hook.reset();
+                g_ngx_create_hook.reset();
+            }
+
+            m_ngx_hooked = true;   // gefunden -> nicht endlos nachversuchen
+        }
+    }
+
+    if (!m_ffx_hooked) {
+        auto dll = GetModuleHandleA("amd_fidelityfx_upscaler_dx12.dll");
+
+        if (dll == nullptr) {
+            dll = GetModuleHandleA("amd_fidelityfx_loader_dx12.dll");
+        }
+
+        if (dll != nullptr) {
+            const bool ok = dlss_hook(g_ffx_create_hook, dll, "ffxCreateContext", (void*)&hk_ffxCreateContext, o_ffxCreateContext)
+                && dlss_hook(g_ffx_destroy_hook, dll, "ffxDestroyContext", (void*)&hk_ffxDestroyContext, o_ffxDestroyContext)
+                && dlss_hook(g_ffx_dispatch_hook, dll, "ffxDispatch", (void*)&hk_ffxDispatch, o_ffxDispatch);
+            spdlog::info("[DLSS_PRO_AUGE] FFX-Hooks: {}", ok);
+
+            if (!ok) {
+                g_ffx_dispatch_hook.reset();
+                g_ffx_destroy_hook.reset();
+                g_ffx_create_hook.reset();
+            }
+
+            m_ffx_hooked = true;
+        }
+    }
+}
+
 // Called when the mod is initialized
 std::optional<std::string> VR::on_initialize_d3d_thread() try {
+    install_upscaler_hooks();   // [DLSS_PRO_AUGE]
+
+    // [AFW 29.09.2026] Plugin nur anfassen, wenn die ECHTE PDAFWPlugin.dll im
+    // Spielordner liegt (DELAYLOAD: ohne DLL wuerde der erste Aufruf abstuerzen).
+    // Der Build-Dummy liefert nullptr -> AFW bleibt dann ebenfalls aus.
+    m_afw_renderer = nullptr;
+
+    if (g_framework->is_dx12()) {
+        if (auto afw_dll = LoadLibraryA("PDAFWPlugin.dll"); afw_dll != nullptr
+            && GetProcAddress(afw_dll, "InitDevice") != nullptr
+            && GetProcAddress(afw_dll, "InitFrameWarp") != nullptr
+            && GetProcAddress(afw_dll, "EvaluateFrameWarp") != nullptr)
+        {
+            auto& d3d12_hook = g_framework->get_d3d12_hook();
+
+            if (d3d12_hook != nullptr && d3d12_hook->get_device() != nullptr && d3d12_hook->get_command_queue() != nullptr) {
+                pd::DeviceParams params{};
+                params.d3d12Device = d3d12_hook->get_device();
+                params.d3d12Queue = d3d12_hook->get_command_queue();
+                m_afw_renderer = pd::InitDevice(params);
+            }
+        }
+    }
     auto openvr_error = initialize_openvr();
 
     if (openvr_error || !m_openvr->loaded) {
@@ -729,6 +1063,48 @@ and place the openxr_loader.dll in the same folder.)";
     return Mod::on_initialize();
 }
 
+// [DLSS_SONDE 29.09.2026] Zaehler seit dem letzten Abruf (danach 0), plus Zustand.
+std::string VR::get_dlss_probe() {
+    std::string seq{};
+    const auto bits = m_dlss_eye_seq.load();
+
+    for (int i = 15; i >= 0; --i) {
+        seq += ((bits >> i) & 1) ? 'R' : 'L';
+    }
+
+    return std::format("eval={} links={} rechts={} fremdhandle={} fixaus={} ohne2={} creates={} releases={} "
+                       "h0={} h1={} fix={} hmd={} per_eye={} seq={}",
+        m_dlss_eval_total.exchange(0), m_dlss_eval_eye[0].exchange(0), m_dlss_eval_eye[1].exchange(0),
+        m_dlss_eval_other.exchange(0), m_dlss_eval_fixoff.exchange(0), m_dlss_eval_nosecond.exchange(0),
+        m_dlss_creates.load(), m_dlss_releases.load(),
+        vrDLSSHandle[0] != nullptr, vrDLSSHandle[1] != nullptr, is_fix_dlss(), is_hmd_active(),
+        upscaler_per_eye_active(), seq);
+}
+
+// [AFW_SONDE 29.09.2026] Zaehler seit dem letzten Abruf (danach 0).
+std::string VR::get_afw_probe() {
+    uint32_t our_w = 0, our_h = 0, our_fmt = 0, depth_w = 0, depth_h = 0;
+    const auto& st = afw::state();
+
+    if (st.mv_desc.pTexture != nullptr) {
+        const auto d = st.mv_desc.pTexture->GetDesc();
+        our_w = (uint32_t)d.Width; our_h = d.Height; our_fmt = (uint32_t)d.Format;
+    }
+
+    if (auto* dt = st.depth_tex.load(); dt != nullptr) {
+        const auto d = dt->GetDesc();
+        depth_w = (uint32_t)d.Width; depth_h = d.Height;
+    }
+
+    return std::format("afw={} frames={} kamera_anders={} max_grad={:.3f} max_mm={:.2f} frame_versatz={} auge_falsch={} | "
+                       "mv_kopiert={} mv_passt_nicht={} mv_keine={} mv_ohne_ziel={} spiel_mv={}x{} fmt={} unsere_mv={}x{} fmt={} tiefe={}x{}",
+        is_using_afw(), m_afw_probe_frames.exchange(0), m_afw_probe_diff.exchange(0),
+        m_afw_probe_max_deg.exchange(0.0f), m_afw_probe_max_mm.exchange(0.0f),
+        m_afw_probe_frame_gap.exchange(0), m_afw_probe_eye_mismatch.exchange(0),
+        m_afw_mv_copied.exchange(0), m_afw_mv_mismatch.exchange(0), m_afw_mv_none.exchange(0), m_afw_mv_notex.exchange(0),
+        m_afw_mv_game_w.load(), m_afw_mv_game_h.load(), m_afw_mv_game_fmt.load(), our_w, our_h, our_fmt, depth_w, depth_h);
+}
+
 void VR::on_lua_state_created(sol::state& lua) {
     lua.new_usertype<VR>("VR",
         "get_controllers", &VR::get_controllers,
@@ -771,6 +1147,8 @@ void VR::on_lua_state_created(sol::state& lua) {
         "is_openvr_loaded", &VR::is_openvr_loaded,
         "is_openxr_loaded", &VR::is_openxr_loaded,
         "is_hmd_active", &VR::is_hmd_active,
+        "get_dlss_probe", &VR::get_dlss_probe,   // [DLSS_SONDE 29.09.2026]
+        "get_afw_probe", &VR::get_afw_probe,     // [AFW_SONDE 29.09.2026]
         "is_action_active", &VR::is_action_active,
         "is_using_hmd_oriented_audio", &VR::is_using_hmd_oriented_audio,
         "toggle_hmd_oriented_audio", &VR::toggle_hmd_oriented_audio,
@@ -2256,8 +2634,86 @@ void VR::on_pre_imgui_frame() {
     m_overlay_component.on_pre_imgui_frame();
 }
 
+// [AFW 29.09.2026 -- RE9-Fork update_camera_data] Kameramatrizen fuer den Warp:
+// src = gerendertes Auge, dest = anderes Auge, cam = Kamera ohne HMD (UI bleibt stehen).
+static glm::mat4 afw_to_reverse_z(const glm::mat4& proj) {
+    const glm::mat4 m{
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, -1, 0,
+        0, 0, 1, 1
+    };
+
+    return m * proj;
+}
+
+void VR::update_afw_camera_data() {
+    auto runtime = get_runtime();
+    std::shared_lock _{runtime->eyes_mtx};
+
+    const int eye = (m_render_frame_count % 2 == m_left_eye_interval) ? 0 : 1;
+    const int other = 1 - eye;
+
+    auto& cd = afw::state().camera[eye];
+
+    // [AFW_SONDE 29.09.2026] nur messen, aendert nichts am Warp
+    {
+        const glm::mat4 snap = m_afw_end_cam;
+        const glm::mat4 now_cam = m_render_camera_matrix;
+        const glm::mat3 rel = glm::transpose(glm::mat3(snap)) * glm::mat3(now_cam);
+        const float c = std::clamp((rel[0][0] + rel[1][1] + rel[2][2] - 1.0f) * 0.5f, -1.0f, 1.0f);
+        const float deg = glm::degrees(std::acos(c));
+        const float mm = glm::length(glm::vec3(now_cam[3]) - glm::vec3(snap[3])) * 1000.0f;
+        const int end_frame = m_afw_end_frame.load();
+
+        ++m_afw_probe_frames;
+
+        if (deg > 0.01f || mm > 0.1f) {
+            ++m_afw_probe_diff;
+        }
+
+        if (end_frame != m_render_frame_count) {
+            ++m_afw_probe_frame_gap;
+        }
+
+        if ((end_frame % 2) != (m_render_frame_count % 2)) {
+            ++m_afw_probe_eye_mismatch;
+        }
+
+        if (deg > m_afw_probe_max_deg.load()) {
+            m_afw_probe_max_deg = deg;
+        }
+
+        if (mm > m_afw_probe_max_mm.load()) {
+            m_afw_probe_max_mm = mm;
+        }
+    }
+    const glm::mat4 eye_render = runtime->eyes[eye];
+    const glm::mat4 eye_other = runtime->eyes[other];
+
+    cd.camViewToWorldMatrix = m_original_camera_matrix;
+    cd.camWorldToViewMatrix = glm::inverse(cd.camViewToWorldMatrix);
+    cd.destViewToWorldMatrix = m_render_camera_matrix * eye_other;
+    cd.srcViewToWorldMatrix = m_render_camera_matrix * eye_render;
+    cd.destWorldToViewMatrix = glm::inverse(cd.destViewToWorldMatrix);
+    cd.srcWorldToViewMatrix = glm::inverse(cd.srcViewToWorldMatrix);
+
+    cd.destViewToClipMatrix = afw_to_reverse_z(runtime->projections[other]);
+    cd.destClipToViewMatrix = glm::inverse(cd.destViewToClipMatrix);
+    cd.srcViewToClipMatrix = afw_to_reverse_z(runtime->projections[eye]);
+    cd.srcClipToViewMatrix = glm::inverse(cd.srcViewToClipMatrix);
+    cd.camViewToClipMatrix = cd.srcViewToClipMatrix;
+    cd.camClipToViewMatrix = cd.srcClipToViewMatrix;
+}
+
 void VR::on_present() {
-    if ((m_render_frame_count + 1) % 2 == m_left_eye_interval) {
+    // [DLSS_PRO_AUGE] Nachversuch, falls nvngx/FFX beim Init noch nicht geladen waren.
+    if ((!m_ngx_hooked || !m_ffx_hooked) && (m_frame_count - m_upscaler_hook_try_frame) > 180) {
+        m_upscaler_hook_try_frame = m_frame_count;
+        install_upscaler_hooks();
+    }
+
+    if ((m_render_frame_count + 1) % 2 == m_left_eye_interval || is_using_afw()) {   // [AFW]
         ResetEvent(m_present_finished_event);
     }
 
@@ -2324,6 +2780,11 @@ void VR::on_present() {
         e = m_d3d11.on_frame(this);
     } else if (renderer == REFramework::RendererType::D3D12) {
         m_is_d3d12 = true;
+
+        if (is_using_afw()) {
+            update_afw_camera_data();   // [AFW 29.09.2026]
+        }
+
         e = m_d3d12.on_frame(this);
     }
 
@@ -2349,7 +2810,7 @@ void VR::on_present() {
         m_submitted = false;
     }
 
-    if ((m_render_frame_count + 1) % 2 == m_left_eye_interval) {
+    if ((m_render_frame_count + 1) % 2 == m_left_eye_interval || is_using_afw()) {   // [AFW]
         SetEvent(m_present_finished_event);
     }
 }
@@ -3193,6 +3654,12 @@ void VR::apply_oni_tonemap() {
                 }
             };
 
+            // [ENGINE-REGLER RAUS 29.09.2026 -- User: das Spiel startet mit eigenem
+            // Wert; Brightness/Contrast jetzt ueber unseren PostPass wie RE4] Kein
+            // Schreiben mehr. Stand noch ein Override an, setzt handle() ihn einmal
+            // auf den Spielwert zurueck (Wert hier fest auf "Default").
+            m_oni_brightness->value() = m_oni_brightness->default_value();
+            m_oni_gamma->value() = m_oni_gamma->default_value();
             handle(*m_oni_brightness, m_oni_ds_brightness, "get_OutputLowerLimit", "set_OutputLowerLimit");
             handle(*m_oni_gamma, m_oni_ds_gamma, "get_Gamma", "set_Gamma");
 
@@ -3202,9 +3669,12 @@ void VR::apply_oni_tonemap() {
         }
     }
 
-    const bool c_on = m_oni_contrast->value() != m_oni_contrast->default_value();
-    const bool s_on = m_oni_shadow_contrast->value() != m_oni_shadow_contrast->default_value();
-    const bool h_on = m_oni_sharpness->value() != m_oni_sharpness->default_value();
+    // [ENGINE-REGLER RAUS 29.09.2026] Contrast/Shadow Contrast der Engine nie mehr schreiben.
+    const bool c_on = false;
+    const bool s_on = false;
+    // [ONI_FARBE] Engine-Sharpness RAUS (User 29.09.2026, endgueltig -- "Engine Sharpness"
+    // war kurz zurueck und ist wieder raus): nie schreiben, das Spiel behaelt seinen Wert.
+    const bool h_on = false;
     const bool vfog_off = !m_oni_volumetric_fog->value();
     const bool ldr_off = !m_oni_ldr_postprocess->value();
 
@@ -3357,7 +3827,8 @@ void VR::on_pre_begin_rendering(void* entry) {
     }
     
     // Call WaitGetPoses
-    if (!inside_on_end && m_frame_count % 2 == m_left_eye_interval) {
+    // [AFW 29.09.2026] Bei AFW jeden Frame (beide Augen gehen jeden Frame raus).
+    if (!inside_on_end && (m_frame_count % 2 == m_left_eye_interval || is_using_afw())) {
         runtime->consume_events(nullptr);
         update_hmd_state();
     }
@@ -3386,12 +3857,33 @@ void VR::on_pre_end_rendering(void* entry) {
         return;
     }
 
-    if (runtime->ready() && m_frame_count % 2 == m_left_eye_interval) {
+    if (runtime->ready() && (m_frame_count % 2 == m_left_eye_interval || is_using_afw())) {
         const auto stage = runtime->get_synchronize_stage();
 
         if (stage == VRRuntime::SynchronizeStage::LATE && runtime->synchronize_frame() == VRRuntime::Error::SUCCESS) {
             if (runtime->is_openxr()) {
                 m_openxr->begin_frame();
+            }
+        }
+    }
+
+    // [AFW 29.09.2026 -- RE9-Fork] Tiefenpuffer des fertig gerenderten Scene-Layers fuer den Warp.
+    if (is_using_afw()) {
+        // [AFW_SONDE] Kamera + Frame genau dieses gerenderten Frames merken.
+        m_afw_end_cam = m_render_camera_matrix;
+        m_afw_end_frame = m_frame_count;
+
+        auto root_layer = sdk::renderer::get_root_layer();
+
+        if (root_layer != nullptr) {
+            auto [output_parent, output_layer] = root_layer->find_layer_recursive("via.render.layer.Output");
+
+            if (output_layer != nullptr && *output_layer != nullptr) {
+                auto valid_scene_layers = (*output_layer)->find_fully_rendered_scene_layers();
+
+                if (!valid_scene_layers.empty() && valid_scene_layers[0] != nullptr) {
+                    afw::state().depth_tex = valid_scene_layers[0]->get_depth_stencil_d3d12();
+                }
             }
         }
     }
@@ -3556,7 +4048,7 @@ void VR::on_wait_rendering(void* entry) {
     // to be signaled
     // only on the left eye interval because we need the right eye
     // to start render work as soon as possible
-    if (((m_frame_count + 1) % 2) == m_left_eye_interval) {
+    if (((m_frame_count + 1) % 2) == m_left_eye_interval || is_using_afw()) {   // [AFW] jeden Frame
         if (WaitForSingleObject(m_present_finished_event, 333) == WAIT_TIMEOUT) {
             timed_out = true;
         }

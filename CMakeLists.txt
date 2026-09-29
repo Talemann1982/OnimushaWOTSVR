@@ -207,6 +207,28 @@ if(REF_BUILD_DEPENDENCIES AND CMAKE_SIZEOF_VOID_P EQUAL 8) # build-framework-dep
 	)
 
 endif()
+# Target: pdafwmod
+if(REF_BUILD_DEPENDENCIES AND CMAKE_SIZEOF_VOID_P EQUAL 8) # build-framework-dependencies
+	set(pdafwmod_SOURCES
+		cmake.toml
+		"dependencies/pd-afwmod/dummy/PDAFWPlugin.cpp"
+	)
+
+	add_library(pdafwmod SHARED)
+
+	target_sources(pdafwmod PRIVATE ${pdafwmod_SOURCES})
+	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${pdafwmod_SOURCES})
+
+	target_include_directories(pdafwmod PUBLIC
+		"dependencies/pd-afwmod/include"
+	)
+
+	set_target_properties(pdafwmod PROPERTIES
+		OUTPUT_NAME
+			PDAFWPlugin
+	)
+
+endif()
 # Target: minhook
 if(REF_BUILD_DEPENDENCIES AND CMAKE_SIZEOF_VOID_P EQUAL 8) # build-framework-dependencies
 	set(minhook_SOURCES
@@ -1509,9 +1531,12 @@ if(REF_BUILD_FRAMEWORK AND CMAKE_SIZEOF_VOID_P EQUAL 8) # build-framework
 		"src/mods/vr/D3D12Component.hpp"
 		"src/mods/vr/OverlayComponent.cpp"
 		"src/mods/vr/OverlayComponent.hpp"
+		"src/mods/vr/UpscaleHelper.hpp"
 		"src/mods/vr/d3d12/ComPtr.hpp"
 		"src/mods/vr/d3d12/CommandContext.cpp"
 		"src/mods/vr/d3d12/CommandContext.hpp"
+		"src/mods/vr/d3d12/PostPass.cpp"
+		"src/mods/vr/d3d12/PostPass.hpp"
 		"src/mods/vr/d3d12/ResourceCopier.cpp"
 		"src/mods/vr/d3d12/ResourceCopier.hpp"
 		"src/mods/vr/d3d12/TextureContext.cpp"
@@ -1525,7 +1550,11 @@ if(REF_BUILD_FRAMEWORK AND CMAKE_SIZEOF_VOID_P EQUAL 8) # build-framework
 		"src/mods/vr/runtimes/VRRuntime.hpp"
 		"src/re2-imgui/af_fadef.h"
 		"src/re2-imgui/af_faprolight.hpp"
+		"src/re2-imgui/font_barlowcondensed_semibold.hpp"
+		"src/re2-imgui/font_requiem9.hpp"
 		"src/re2-imgui/font_robotomedium.hpp"
+		"src/re2-imgui/img_oni_bindings.hpp"
+		"src/re2-imgui/img_oni_logo.hpp"
 		"src/re2-imgui/imgui_impl_dx11.cpp"
 		"src/re2-imgui/imgui_impl_dx11.h"
 		"src/re2-imgui/imgui_impl_dx12.cpp"
@@ -1589,6 +1618,7 @@ if(REF_BUILD_FRAMEWORK AND CMAKE_SIZEOF_VOID_P EQUAL 8) # build-framework
 		imguizmo
 		imnodes
 		minhook
+		pdafwmod
 		d3d11
 		glm_static
 		shlwapi
@@ -1603,7 +1633,7 @@ if(REF_BUILD_FRAMEWORK AND CMAKE_SIZEOF_VOID_P EQUAL 8) # build-framework
 		OUTPUT_NAME
 			dinput8
 		LINK_FLAGS
-			"/DELAYLOAD:openvr_api.dll /DELAYLOAD:openxr_loader.dll /DELAYLOAD:d3d11.dll /DELAYLOAD:d3d12.dll /DELAYLOAD:D3DCOMPILER_47.dll"
+			"/DELAYLOAD:openvr_api.dll /DELAYLOAD:openxr_loader.dll /DELAYLOAD:PDAFWPlugin.dll /DELAYLOAD:d3d11.dll /DELAYLOAD:d3d12.dll /DELAYLOAD:D3DCOMPILER_47.dll"
 		RUNTIME_OUTPUT_DIRECTORY_RELEASE
 			"${CMAKE_BINARY_DIR}/bin/REFramework"
 		RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO

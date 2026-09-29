@@ -14,6 +14,7 @@
 
 #include "d3d12/ResourceCopier.hpp"
 #include "d3d12/TextureContext.hpp"
+#include "d3d12/PostPass.hpp"   // [POST_PASS 28.09.2026]
 
 #define XR_USE_PLATFORM_WIN32
 #define XR_USE_GRAPHICS_API_D3D11
@@ -56,6 +57,19 @@ private:
     ID3D12Resource* m_ui_buffer_src{nullptr};
     bool m_ui_buffer_failed{false};
     std::array<d3d12::ResourceCopier, 3> m_generic_copiers{};
+
+    // [POST_PASS 28.09.2026] Schaerfe/Saettigung/SMAA auf dem Augenbild (portiert aus
+    // dem RE4-Fork). Arbeitskopie, weil der Backbuffer selbst nicht als SRV taugt.
+    d3d12::PostPass m_post_pass{};
+    d3d12::SmaaPass m_smaa_pass{};
+    std::array<d3d12::CommandContext, 3> m_post_commands{};
+    ComPtr<ID3D12Resource> m_post_work{};
+    void apply_post_pass(VR* vr, ID3D12Device* device, ID3D12Resource* eye, D3D12_RESOURCE_STATES eye_state, uint64_t frame_count);
+
+    // [AFW 29.09.2026] Warp + Abgabe BEIDER Augen in diesem Frame. false = nicht moeglich
+    // (Plugin/Puffer fehlen) -> normaler AFR-Weg. e_out = Fehler aus dem OpenVR-Submit.
+    bool afw_frame(VR* vr, ID3D12CommandQueue* command_queue, ID3D12Resource* eye_texture,
+                   D3D12_RESOURCE_STATES eye_state, UINT backbuffer_index, vr::EVRCompositorError& e_out);
 
     std::unique_ptr<DirectX::DX12::SpriteBatch> m_sprite_batch{};
 
@@ -108,7 +122,8 @@ private:
         void initialize(XrSessionCreateInfo& session_info);
         std::optional<std::string> create_swapchains();
         void destroy_swapchains();
-        void copy(uint32_t swapchain_idx, ID3D12Resource* src);
+        // [AFW 29.09.2026] src_state: AFW gibt Texturen im Shader-Zustand ab (RE9-Fork).
+        void copy(uint32_t swapchain_idx, ID3D12Resource* src, D3D12_RESOURCE_STATES src_state = D3D12_RESOURCE_STATE_PRESENT);
         void wait_for_all_copies() {
             std::scoped_lock _{this->mtx};
 
